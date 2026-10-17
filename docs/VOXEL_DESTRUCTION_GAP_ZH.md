@@ -113,3 +113,17 @@ CCC 已经采用稀疏 `8³` brick 和 dirty-region 思路；Avian 已经有子�
 ## 结论
 
 当前 fork 已从“普通刚体接触”迈向“可破坏接触”的 solver 基础，但距离参考技术的关键差距集中在同一步拓扑变化后的重求解、守恒可验证的断裂动力学，以及物理到视觉的版本化发布。P0 应先于大规模碎片和渲染优化完成；否则后续性能数据会混入失效接触造成的物理错误。
+
+## 3D Avian 接口落地状态
+
+本次实现把 P0 的 solver 边界落到了 Avian 3D：
+
+- `ContactImpulseLimit` 可挂在 collider 或 rigid body 上，接触会使用双方较小的有限冲量上限；
+- `ContactBreakEvent` 在 relaxation 后报告超限接触，事件包含 collider/body、容量和未截断请求值；
+- `ContactBreakageSystems::Apply` 可在同一子步中编辑体素/材质并刷新 manifold；
+- `ContactGraph::replace_manifolds` 返回 manifold 数量变化，配合 `ContactStatusChangeQueue` 和 `ContactReseolveQueue` 更新约束图；
+- `ContactBreakageSystems::ReSolve` 只重建受影响 contact ID，并在 `SolverConfig::contact_re_solve_max_passes` 限制内重新 warm-start、solve；
+- `PhysicsStepRevision` 与 `ContactGraph::revision` 为异步 collider/mesh/BLAS 发布提供版本锚点；
+- `SolverDiagnostics` 增加 break event、re-solve 完成和 dropped 计数。
+
+这条路径已经覆盖“超限 → 破坏回调 → manifold 刷新 → 约束局部重建 → 同子步重求解”的接口闭环。体素后端仍需要提供真实的 3D manifold 刷新、碎片质量/惯量更新和渲染发布计时，才能完成 P1/P2 的运行时验收。

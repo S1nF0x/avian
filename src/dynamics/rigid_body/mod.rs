@@ -12,7 +12,8 @@ mod world_query;
 
 pub use locked_axes::LockedAxes;
 pub use physics_material::{
-    CoefficientCombine, DefaultFriction, DefaultRestitution, Friction, Restitution,
+    CoefficientCombine, ContactImpulseLimit, DefaultFriction, DefaultRestitution, Friction,
+    Restitution,
 };
 pub use world_query::*;
 

@@ -103,8 +103,8 @@ pub mod prelude {
         CollisionEnd, CollisionEventsEnabled, CollisionStart, OnCollisionEnd, OnCollisionStart,
     };
     pub use super::contact_types::{
-        Collisions, ContactEdge, ContactGraph, ContactManifold, ContactPair, ContactPairFlags,
-        ContactPoint,
+        Collisions, ContactEdge, ContactGraph, ContactId, ContactManifold, ContactPair,
+        ContactPairFlags, ContactPoint,
     };
     pub use super::hooks::{ActiveCollisionHooks, CollisionHooks};
     #[expect(deprecated)]

@@ -1,5 +1,56 @@
 use bevy::prelude::*;
 
+/// Limits the accumulated normal impulse that a contact can apply.
+///
+/// This is useful for breakable materials such as glass, wood, or brittle
+/// joints. The value is expressed in impulse units (N⋅s in SI units). A
+/// collider value takes precedence over the value on its rigid body. When two
+/// colliders meet, the smaller finite capacity is used.
+///
+/// The limit only controls contact response. It does not mutate colliders or
+/// trigger a fracture by itself; use [`ContactBreakEvent`](crate::dynamics::solver::ContactBreakEvent)
+/// or the contact graph to drive the material/topology change.
+#[derive(Reflect, Clone, Copy, Component, Debug, PartialEq, PartialOrd)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+#[reflect(Debug, Component, PartialEq)]
+pub struct ContactImpulseLimit(pub f32);
+
+impl ContactImpulseLimit {
+    /// An unbounded contact impulse limit.
+    pub const UNBOUNDED: Self = Self(f32::INFINITY);
+
+    /// Creates a finite contact impulse limit. Negative and non-finite values
+    /// are treated as unbounded or zero as appropriate by the solver.
+    #[inline]
+    pub fn new(max_impulse_ns: f32) -> Self {
+        Self(max_impulse_ns)
+    }
+
+    /// Combines two limits conservatively by selecting the smaller finite value.
+    #[inline]
+    pub fn combine(self, other: Self) -> Self {
+        let a = if self.0.is_finite() { self.0.max(0.0) } else { f32::INFINITY };
+        let b = if other.0.is_finite() { other.0.max(0.0) } else { f32::INFINITY };
+        Self(a.min(b))
+    }
+
+    /// Returns the normalized value used by contact constraints.
+    #[inline]
+    pub fn normalized(self) -> f32 {
+        if self.0.is_finite() {
+            self.0.max(0.0)
+        } else {
+            f32::INFINITY
+        }
+    }
+}
+
+impl Default for ContactImpulseLimit {
+    fn default() -> Self {
+        Self::UNBOUNDED
+    }
+}
+
 /// Determines how coefficients are combined for [`Restitution`] and [`Friction`].
 /// The default is `Average`.
 ///
@@ -397,6 +448,19 @@ impl From<f32> for Restitution {
 mod tests {
     use crate::prelude::*;
     use approx::assert_relative_eq;
+
+    #[test]
+    fn contact_impulse_limits_combine_conservatively() {
+        assert_eq!(
+            ContactImpulseLimit::new(12.0).combine(ContactImpulseLimit::new(5.0)),
+            ContactImpulseLimit::new(5.0)
+        );
+        assert_eq!(
+            ContactImpulseLimit::UNBOUNDED.combine(ContactImpulseLimit::new(5.0)),
+            ContactImpulseLimit::new(5.0)
+        );
+        assert_eq!(ContactImpulseLimit::new(-1.0).normalized(), 0.0);
+    }
 
     // TODO: Test `CoefficientCombine` directly
     #[test]

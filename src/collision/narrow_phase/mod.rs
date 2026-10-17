@@ -251,6 +251,7 @@ fn update_narrow_phase<C: AnyCollider, H: CollisionHooks + 'static>(
     mut collision_started_writer: MessageWriter<CollisionStart>,
     mut collision_ended_writer: MessageWriter<CollisionEnd>,
     time: Res<Time>,
+    step_revision: Res<PhysicsStepRevision>,
     hooks: StaticSystemParam<H>,
     context: StaticSystemParam<C::Context>,
     mut commands: ParallelCommands,
@@ -269,6 +270,8 @@ fn update_narrow_phase<C: AnyCollider, H: CollisionHooks + 'static>(
         &mut diagnostics,
         &mut commands,
     );
+
+    narrow_phase.contact_graph.revision = step_revision.0;
 
     diagnostics.narrow_phase = start.elapsed();
     diagnostics.contact_count = narrow_phase.contact_graph.edges.edge_count() as u32;

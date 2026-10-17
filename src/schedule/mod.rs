@@ -63,6 +63,7 @@ impl Plugin for PhysicsSchedulePlugin {
         app.init_resource::<Time<Physics>>()
             .insert_resource(Time::new_with(Substeps))
             .init_resource::<SubstepCount>()
+            .init_resource::<PhysicsStepRevision>()
             .init_resource::<LastPhysicsTick>();
 
         // TODO: Where should this be initialized?
@@ -106,6 +107,11 @@ impl Plugin for PhysicsSchedulePlugin {
                     .chain(),
             );
         });
+
+        app.add_systems(
+            PhysicsSchedule,
+            advance_physics_step_revision.in_set(PhysicsStepSystems::First),
+        );
 
         app.add_systems(
             schedule,
@@ -221,6 +227,19 @@ pub type PhysicsStepSet = PhysicsStepSystems;
 #[derive(Resource, Reflect, Default)]
 #[reflect(Resource, Default)]
 pub struct LastPhysicsTick(pub Tick);
+
+/// Monotonically increasing revision for the current physics step.
+///
+/// Voxel, collider, mesh, and render publication systems can copy this value
+/// into their own derived representation metadata to make stale asynchronous
+/// work observable.
+#[derive(Resource, Reflect, Default, Debug, Clone, Copy, PartialEq, Eq)]
+#[reflect(Resource, Default, Debug, PartialEq)]
+pub struct PhysicsStepRevision(pub u64);
+
+fn advance_physics_step_revision(mut revision: ResMut<PhysicsStepRevision>) {
+    revision.0 = revision.0.wrapping_add(1);
+}
 
 pub(crate) fn is_changed_after_tick<C: Component>(
     component_ref: Ref<C>,

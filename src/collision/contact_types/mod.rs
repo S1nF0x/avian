@@ -368,6 +368,9 @@ pub struct ContactManifold {
     pub friction: f32,
     /// The effective coefficient of [restitution](Restitution) used for the contact surface.
     pub restitution: f32,
+    /// The maximum accumulated normal impulse allowed for this contact
+    /// surface. `f32::INFINITY` means that the contact is unbounded.
+    pub max_normal_impulse: f32,
     /// The desired relative linear speed of the bodies along the surface,
     /// expressed in world space as `tangent_speed2 - tangent_speed1`.
     ///
@@ -401,6 +404,7 @@ impl ContactManifold {
             normal,
             friction: 0.0,
             restitution: 0.0,
+            max_normal_impulse: f32::INFINITY,
             #[cfg(feature = "2d")]
             tangent_speed: 0.0,
             #[cfg(feature = "3d")]

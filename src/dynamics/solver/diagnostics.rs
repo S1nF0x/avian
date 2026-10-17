@@ -37,6 +37,14 @@ pub struct SolverDiagnostics {
     pub swept_ccd: Duration,
     /// The number of contact constraints generated.
     pub contact_constraint_count: u32,
+    /// The number of contact capacity failures reported this physics step.
+    pub contact_break_event_count: u32,
+    /// The number of bounded same-substep contact re-solves completed.
+    pub contact_re_solve_count: u32,
+    /// Time spent rebuilding and re-solving breakage contacts.
+    pub contact_re_solve: Duration,
+    /// The number of re-solve requests dropped after reaching the pass limit.
+    pub contact_re_solve_dropped: u32,
 }
 
 impl PhysicsDiagnostics for SolverDiagnostics {
@@ -50,6 +58,7 @@ impl PhysicsDiagnostics for SolverDiagnostics {
             (Self::INTEGRATE_VELOCITIES, self.integrate_velocities),
             (Self::WARM_START, self.warm_start),
             (Self::SOLVE_CONSTRAINTS, self.solve_constraints),
+            (Self::CONTACT_RE_SOLVE, self.contact_re_solve),
             (Self::INTEGRATE_POSITIONS, self.integrate_positions),
             (Self::RELAX_VELOCITIES, self.relax_velocities),
             (Self::APPLY_RESTITUTION, self.apply_restitution),
@@ -63,6 +72,15 @@ impl PhysicsDiagnostics for SolverDiagnostics {
         vec![(
             Self::CONTACT_CONSTRAINT_COUNT,
             self.contact_constraint_count,
+        ),
+        (
+            Self::CONTACT_BREAK_EVENT_COUNT,
+            self.contact_break_event_count,
+        ),
+        (Self::CONTACT_RE_SOLVE_COUNT, self.contact_re_solve_count),
+        (
+            Self::CONTACT_RE_SOLVE_DROPPED,
+            self.contact_re_solve_dropped,
         )]
     }
 }
@@ -81,5 +99,9 @@ impl_diagnostic_paths! {
         STORE_IMPULSES: "avian/solver/store_impulses",
         SWEPT_CCD: "avian/solver/swept_ccd",
         CONTACT_CONSTRAINT_COUNT: "avian/solver/contact_constraint_count",
+        CONTACT_BREAK_EVENT_COUNT: "avian/solver/contact_break_event_count",
+        CONTACT_RE_SOLVE_COUNT: "avian/solver/contact_re_solve_count",
+        CONTACT_RE_SOLVE: "avian/solver/contact_re_solve",
+        CONTACT_RE_SOLVE_DROPPED: "avian/solver/contact_re_solve_dropped",
     }
 }

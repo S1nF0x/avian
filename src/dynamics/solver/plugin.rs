@@ -11,7 +11,7 @@ use crate::{
             },
             contact::ContactConstraint,
             islands::{BodyIslandNode, IslandId, PhysicsIslands, WakeIslands},
-            schedule::SubstepSolverSystems,
+            schedule::{ContactBreakageSystems, SubstepSolverSystems},
             softness_parameters::{SoftnessCoefficients, SoftnessParameters},
             solver_body::{
                 SolverBodies, SolverBodiesAccess, SolverBody, SolverBodyIndex, SolverBodyInertia,
@@ -100,7 +100,9 @@ impl Plugin for SolverPlugin {
         app.init_resource::<SolverConfig>()
             .init_resource::<ContactSoftnessCoefficients>()
             .init_resource::<ContactConstraints>()
+            .init_resource::<ContactReseolveQueue>()
             .init_resource::<ConstraintGraph>();
+        app.add_message::<ContactBreakEvent>();
 
         if app
             .world()
@@ -176,6 +178,19 @@ impl Plugin for SolverPlugin {
             )
                 .chain()
                 .in_set(SubstepSolverSystems::Damping),
+        );
+
+        substeps.add_systems(
+            emit_contact_break_events.in_set(ContactBreakageSystems::Detect),
+        );
+        substeps.add_systems(
+            (
+                apply_contact_status_changes,
+                rebuild_requested_contact_constraints,
+                re_solve_requested_contacts,
+            )
+                .chain()
+                .in_set(ContactBreakageSystems::ReSolve),
         );
     }
 
@@ -585,6 +600,14 @@ pub struct SolverConfig {
     ///
     /// Default: `1`
     pub restitution_iterations: usize,
+
+    /// Maximum number of same-substep contact re-solves requested by
+    /// [`ContactReseolveQueue`] before the request is dropped for this
+    /// substep. This bounds work when a topology edit repeatedly invalidates
+    /// contacts.
+    ///
+    /// Default: `2`
+    pub contact_re_solve_max_passes: u8,
 }
 
 impl Default for SolverConfig {
@@ -596,8 +619,123 @@ impl Default for SolverConfig {
             warm_start_coefficient: 1.0,
             restitution_threshold: 1.0,
             restitution_iterations: 1,
+            contact_re_solve_max_passes: 2,
         }
     }
+}
+
+/// A request to rebuild one or more contact constraints during the current
+/// substep.
+///
+/// The request is intentionally separate from the contact graph: an owning
+/// voxel system can edit its authoritative geometry, refresh the affected
+/// manifolds, and then request only the contact IDs whose constraints became
+/// stale. Requests are consumed by the [`ContactBreakageSystems::ReSolve`]
+/// set and are bounded by [`SolverConfig::contact_re_solve_max_passes`].
+#[derive(Resource, Debug, Default)]
+pub struct ContactReseolveQueue {
+    pending: Vec<ContactId>,
+    pending_all: bool,
+    passes_this_substep: u8,
+    prepared: bool,
+    dropped_this_substep: bool,
+}
+
+impl ContactReseolveQueue {
+    /// Requests a bounded re-solve for one contact pair.
+    #[inline]
+    pub fn request_contact(&mut self, contact_id: ContactId) {
+        if !self.pending_all && !self.pending.contains(&contact_id) {
+            self.pending.push(contact_id);
+        }
+    }
+
+    /// Requests a bounded re-solve for every active contact constraint.
+    #[inline]
+    pub fn request_all(&mut self) {
+        self.pending.clear();
+        self.pending_all = true;
+    }
+
+    /// Returns the number of contact IDs waiting for a re-solve.
+    #[inline]
+    pub fn pending_contact_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Returns whether a full contact rebuild was requested.
+    #[inline]
+    pub fn is_full_rebuild_requested(&self) -> bool {
+        self.pending_all
+    }
+
+    pub(crate) fn begin_substep(&mut self) {
+        self.passes_this_substep = 0;
+        self.prepared = false;
+        self.dropped_this_substep = false;
+    }
+
+    fn take_for_rebuild(&mut self, max_passes: u8) -> Option<Option<Vec<ContactId>>> {
+        if !self.pending_all && self.pending.is_empty() {
+            return None;
+        }
+
+        let max_passes = max_passes.max(1);
+        if self.passes_this_substep >= max_passes {
+            self.pending.clear();
+            self.pending_all = false;
+            self.dropped_this_substep = true;
+            return None;
+        }
+
+        self.passes_this_substep += 1;
+        self.prepared = true;
+        if self.pending_all {
+            self.pending_all = false;
+            Some(None)
+        } else {
+            self.pending.sort_unstable();
+            Some(Some(core::mem::take(&mut self.pending)))
+        }
+    }
+
+    fn take_prepared(&mut self) -> bool {
+        core::mem::take(&mut self.prepared)
+    }
+
+    fn clear_pending(&mut self) {
+        self.pending.clear();
+        self.pending_all = false;
+        self.prepared = false;
+    }
+
+    fn take_dropped(&mut self) -> bool {
+        core::mem::take(&mut self.dropped_this_substep)
+    }
+}
+
+/// A material contact whose configured normal impulse capacity was exceeded.
+///
+/// The event is emitted after the relaxation pass. A breakage system should
+/// update the authoritative material/topology, refresh the affected contact
+/// manifolds, and call [`ContactReseolveQueue::request_contact`] before the
+/// [`ContactBreakageSystems::ReSolve`] set runs.
+#[derive(Message, Clone, Copy, Debug, PartialEq)]
+pub struct ContactBreakEvent {
+    /// The stable contact pair identifier.
+    pub contact_id: ContactId,
+    /// The first collider in the contact pair.
+    pub collider1: Entity,
+    /// The second collider in the contact pair.
+    pub collider2: Entity,
+    /// The first rigid body, if the collider is attached to one.
+    pub body1: Option<Entity>,
+    /// The second rigid body, if the collider is attached to one.
+    pub body2: Option<Entity>,
+    /// The configured capacity in impulse units.
+    pub max_normal_impulse: f32,
+    /// The largest requested normal impulse in the failed constraint points.
+    pub requested_normal_impulse: f32,
 }
 
 /// The [`SoftnessCoefficients`] used for contacts.
@@ -661,20 +799,53 @@ pub(super) struct BodyQuery {
 
 fn prepare_contact_constraints(
     contact_graph: Res<ContactGraph>,
-    mut constraint_graph: ResMut<ConstraintGraph>,
+    constraint_graph: ResMut<ConstraintGraph>,
     mut diagnostics: ResMut<SolverDiagnostics>,
     bodies: Query<BodyQuery, RigidBodyActiveFilter>,
     solver_bodies: Res<SolverBodies>,
     narrow_phase_config: Res<NarrowPhaseConfig>,
     contact_softness: Res<ContactSoftnessCoefficients>,
+    mut re_solve_queue: ResMut<ContactReseolveQueue>,
+) {
+    // The normal preparation pass always rebuilds the complete graph. Any
+    // request queued before the solver belongs to the same physics step and
+    // is therefore satisfied by this full preparation.
+    re_solve_queue.clear_pending();
+    prepare_contact_constraints_internal(
+        contact_graph,
+        constraint_graph,
+        &mut diagnostics,
+        bodies,
+        solver_bodies,
+        narrow_phase_config,
+        contact_softness,
+        None,
+    );
+}
+
+fn prepare_contact_constraints_internal(
+    contact_graph: Res<ContactGraph>,
+    mut constraint_graph: ResMut<ConstraintGraph>,
+    diagnostics: &mut SolverDiagnostics,
+    bodies: Query<BodyQuery, RigidBodyActiveFilter>,
+    solver_bodies: Res<SolverBodies>,
+    narrow_phase_config: Res<NarrowPhaseConfig>,
+    contact_softness: Res<ContactSoftnessCoefficients>,
+    requested_contacts: Option<&[ContactId]>,
 ) {
     let start = crate::utils::Instant::now();
 
     for color in constraint_graph.colors.iter_mut() {
-        // TODO: Instead of clearing the vector, we could resize it, and just overwrite the old values in the loop below.
-        //       Then the inner loop could be parallelized too.
-        // TODO: Box2D uses an arena allocator for constraints. Might be worth looking into?
-        color.contact_constraints.clear();
+        if let Some(requested_contacts) = requested_contacts {
+            color
+                .contact_constraints
+                .retain(|constraint| requested_contacts.binary_search(&constraint.contact_id).is_err());
+        } else {
+            // TODO: Instead of clearing the vector, we could resize it, and just overwrite the old values in the loop below.
+            //       Then the inner loop could be parallelized too.
+            // TODO: Box2D uses an arena allocator for constraints. Might be worth looking into?
+            color.contact_constraints.clear();
+        }
     }
 
     // Get colors with at least one active manifold handle.
@@ -687,6 +858,11 @@ fn prepare_contact_constraints(
     // Generate contact constraints for each contact pair, parallelizing over graph colors.
     crate::utils::par_for_each(&mut active_colors, 2, |_i, color| {
         for handle in color.manifold_handles.iter() {
+            if let Some(requested_contacts) = requested_contacts
+                && requested_contacts.binary_search(&handle.contact_id).is_err()
+            {
+                continue;
+            }
             // Get the contact pair and its manifold.
             let contact_pair = contact_graph
                 .get_by_id(handle.contact_id)
@@ -695,7 +871,12 @@ fn prepare_contact_constraints(
                 })
                 .1;
             let manifold_index = handle.manifold_index;
-            let manifold = &contact_pair.manifolds[manifold_index];
+            let Some(manifold) = contact_pair.manifolds.get(manifold_index) else {
+                // A topology owner may have removed a manifold while the
+                // status queue is being applied. The stale handle is skipped
+                // and will be removed by the next graph synchronization.
+                continue;
+            };
 
             if !contact_pair.generates_constraints() {
                 continue;
@@ -758,6 +939,179 @@ fn prepare_contact_constraints(
         .iter()
         .map(|color| color.contact_constraints.len())
         .sum::<usize>() as u32;
+}
+
+/// Rebuilds the contact constraints requested by a breakage system. Existing
+/// constraints outside the requested contact set are retained, so the
+/// rebuild is local to the affected contact IDs while the following solve can
+/// still converge against all bodies in the island.
+#[allow(clippy::too_many_arguments)]
+fn rebuild_requested_contact_constraints(
+    contact_graph: Res<ContactGraph>,
+    constraint_graph: ResMut<ConstraintGraph>,
+    mut diagnostics: ResMut<SolverDiagnostics>,
+    bodies: Query<BodyQuery, RigidBodyActiveFilter>,
+    solver_bodies: Res<SolverBodies>,
+    narrow_phase_config: Res<NarrowPhaseConfig>,
+    contact_softness: Res<ContactSoftnessCoefficients>,
+    solver_config: Res<SolverConfig>,
+    mut re_solve_queue: ResMut<ContactReseolveQueue>,
+) {
+    let request = re_solve_queue.take_for_rebuild(solver_config.contact_re_solve_max_passes);
+    if let Some(request) = request {
+        let requested_contacts = request.as_deref();
+        prepare_contact_constraints_internal(
+            contact_graph,
+            constraint_graph,
+            &mut diagnostics,
+            bodies,
+            solver_bodies,
+            narrow_phase_config,
+            contact_softness,
+            requested_contacts,
+        );
+    }
+
+    if re_solve_queue.take_dropped() {
+        diagnostics.contact_re_solve_dropped += 1;
+    }
+}
+
+/// Re-solves the contact constraints after a breakage system has refreshed the
+/// affected manifolds. The work is bounded by the queue's pass limit and does
+/// not integrate positions a second time.
+#[allow(clippy::too_many_arguments)]
+fn re_solve_requested_contacts(
+    mut solver_bodies: ResMut<SolverBodies>,
+    mut constraint_graph: ResMut<ConstraintGraph>,
+    solver_config: Res<SolverConfig>,
+    length_unit: Res<PhysicsLengthUnit>,
+    time: Res<Time>,
+    mut diagnostics: ResMut<SolverDiagnostics>,
+    mut re_solve_queue: ResMut<ContactReseolveQueue>,
+) {
+    if !re_solve_queue.take_prepared() {
+        return;
+    }
+
+    let start = crate::utils::Instant::now();
+
+    let access = solver_bodies.access();
+
+    for constraint in constraint_graph.colors[COLOR_OVERFLOW_INDEX]
+        .contact_constraints
+        .iter_mut()
+    {
+        warm_start_internal(&access, constraint, solver_config.warm_start_coefficient);
+    }
+
+    for color in constraint_graph
+        .colors
+        .iter_mut()
+        .take(COLOR_OVERFLOW_INDEX)
+        .filter(|color| !color.contact_constraints.is_empty())
+    {
+        crate::utils::par_for_each(&mut color.contact_constraints, 64, |_i, constraint| {
+            warm_start_internal(&access, constraint, solver_config.warm_start_coefficient);
+        });
+    }
+
+    let max_overlap_solve_speed = solver_config.max_overlap_solve_speed * length_unit.0;
+    let delta_secs = time.delta_secs();
+
+    for constraint in constraint_graph.colors[COLOR_OVERFLOW_INDEX]
+        .contact_constraints
+        .iter_mut()
+    {
+        solve_contacts_internal::<true>(
+            &access,
+            constraint,
+            max_overlap_solve_speed,
+            delta_secs,
+        );
+        solve_contacts_internal::<false>(
+            &access,
+            constraint,
+            max_overlap_solve_speed,
+            delta_secs,
+        );
+    }
+
+    for color in constraint_graph
+        .colors
+        .iter_mut()
+        .take(COLOR_OVERFLOW_INDEX)
+        .filter(|color| !color.contact_constraints.is_empty())
+    {
+        crate::utils::par_for_each(&mut color.contact_constraints, 64, |_i, constraint| {
+            solve_contacts_internal::<true>(
+                &access,
+                constraint,
+                max_overlap_solve_speed,
+                delta_secs,
+            );
+            solve_contacts_internal::<false>(
+                &access,
+                constraint,
+                max_overlap_solve_speed,
+                delta_secs,
+            );
+        });
+    }
+
+    diagnostics.contact_re_solve_count += 1;
+    diagnostics.contact_re_solve += start.elapsed();
+}
+
+/// Emits one breakage message per contact pair whose configured normal
+/// impulse capacity was exceeded during the current substep.
+fn emit_contact_break_events(
+    contact_graph: Res<ContactGraph>,
+    constraint_graph: Res<ConstraintGraph>,
+    mut events: MessageWriter<ContactBreakEvent>,
+    mut diagnostics: ResMut<SolverDiagnostics>,
+) {
+    let mut emitted = Vec::new();
+
+    for color in &constraint_graph.colors {
+        for constraint in &color.contact_constraints {
+            if emitted.contains(&constraint.contact_id)
+                || !constraint
+                    .points
+                    .iter()
+                    .any(|point| point.normal_part.capacity_exceeded)
+            {
+                continue;
+            }
+
+            let Some((_, contact_pair)) = contact_graph.get_by_id(constraint.contact_id) else {
+                continue;
+            };
+
+            let max_normal_impulse = constraint
+                .points
+                .iter()
+                .map(|point| point.normal_part.max_impulse)
+                .fold(f32::INFINITY, f32::min);
+            let requested_normal_impulse = constraint
+                .points
+                .iter()
+                .map(|point| point.normal_part.last_requested_impulse)
+                .fold(0.0, f32::max);
+
+            events.write(ContactBreakEvent {
+                contact_id: constraint.contact_id,
+                collider1: contact_pair.collider1,
+                collider2: contact_pair.collider2,
+                body1: contact_pair.body1,
+                body2: contact_pair.body2,
+                max_normal_impulse,
+                requested_normal_impulse,
+            });
+            emitted.push(constraint.contact_id);
+            diagnostics.contact_break_event_count += 1;
+        }
+    }
 }
 
 /// Warm starts the solver by applying the impulses from the previous frame or substep.
@@ -1167,6 +1521,23 @@ pub fn joint_damping<T: Component + EntityConstraint<2>>(
 
         body1.linear_velocity += p * w1;
         body2.linear_velocity -= p * w2;
+    }
+}
+
+#[cfg(test)]
+mod contact_re_solve_tests {
+    use super::*;
+
+    #[test]
+    fn contact_re_solve_requests_are_bounded_per_substep() {
+        let mut queue = ContactReseolveQueue::default();
+        queue.begin_substep();
+        queue.request_contact(ContactId(7));
+        assert!(queue.take_for_rebuild(1).is_some());
+
+        queue.request_contact(ContactId(7));
+        assert!(queue.take_for_rebuild(1).is_none());
+        assert!(queue.take_dropped());
     }
 }
 

@@ -187,7 +187,7 @@ impl ContactConstraint {
             let anchor1 = point.anchor1;
             let anchor2 = point.anchor2;
 
-            let point = ContactConstraintPoint {
+            let mut point = ContactConstraintPoint {
                 // TODO: Apply warm starting scale here instead of in `warm_start`?
                 normal_part: ContactNormalPart::generate(
                     effective_inverse_mass_sum,
@@ -214,6 +214,10 @@ impl ContactConstraint {
                 normal_speed: point.normal_speed,
                 initial_separation: -point.penetration - (anchor2 - anchor1).dot(manifold.normal),
             };
+
+            point
+                .normal_part
+                .set_maximum_normal_impulse(manifold.max_normal_impulse);
 
             points.push(point);
         }

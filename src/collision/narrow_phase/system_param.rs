@@ -34,6 +34,7 @@ struct ColliderQuery<C: AnyCollider> {
     layers: Read<CollisionLayers>,
     friction: Option<Read<Friction>>,
     restitution: Option<Read<Restitution>>,
+    max_normal_impulse: Option<Read<ContactImpulseLimit>>,
     collision_margin: Option<Read<CollisionMargin>>,
     is_sensor: Has<Sensor>,
 }
@@ -50,6 +51,7 @@ struct RigidBodyQuery {
     // TODO: We should define these as purely collider components and not query for them here.
     friction: Option<Read<Friction>>,
     restitution: Option<Read<Restitution>>,
+    max_normal_impulse: Option<Read<ContactImpulseLimit>>,
     collision_margin: Option<Read<CollisionMargin>>,
     speculative_ccd: Option<Read<SpeculativeCcd>>,
     size_metrics: Read<BodySizeMetrics>,
@@ -517,6 +519,7 @@ impl<C: AnyCollider> NarrowPhase<'_, '_, C> {
                     lin_vel1,
                     ang_vel1,
                     rb_friction1,
+                    rb_max_normal_impulse1,
                     rb_collision_margin1,
                     speculative_ccd1,
                     size_metrics1,
@@ -532,6 +535,7 @@ impl<C: AnyCollider> NarrowPhase<'_, '_, C> {
                             body.linear_velocity.0,
                             body.angular_velocity.0,
                             body.friction,
+                            body.max_normal_impulse,
                             body.collision_margin,
                             body.speculative_ccd.copied(),
                             *body.size_metrics,
@@ -547,6 +551,7 @@ impl<C: AnyCollider> NarrowPhase<'_, '_, C> {
                     lin_vel2,
                     ang_vel2,
                     rb_friction2,
+                    rb_max_normal_impulse2,
                     rb_collision_margin2,
                     speculative_ccd2,
                     size_metrics2,
@@ -562,12 +567,30 @@ impl<C: AnyCollider> NarrowPhase<'_, '_, C> {
                             body.linear_velocity.0,
                             body.angular_velocity.0,
                             body.friction,
+                            body.max_normal_impulse,
                             body.collision_margin,
                             body.speculative_ccd.copied(),
                             *body.size_metrics,
                         )
                     })
                     .unwrap_or_default();
+
+                // A collider-level material overrides its body's value. The
+                // contact uses the smaller finite capacity so either material
+                // can be the weak link in a breakable surface.
+                let max_normal_impulse1 = collider1
+                    .max_normal_impulse
+                    .or(rb_max_normal_impulse1)
+                    .copied()
+                    .unwrap_or_default();
+                let max_normal_impulse2 = collider2
+                    .max_normal_impulse
+                    .or(rb_max_normal_impulse2)
+                    .copied()
+                    .unwrap_or_default();
+                let max_normal_impulse = max_normal_impulse1
+                    .combine(max_normal_impulse2)
+                    .normalized();
 
                 // Store these to avoid having to query for the bodies
                 // when processing status changes for the constraint graph.
@@ -675,6 +698,7 @@ impl<C: AnyCollider> NarrowPhase<'_, '_, C> {
                     let com12 = world_com2 - world_com1 + pos12;
 
                     contacts.manifolds.iter_mut().for_each(|manifold| {
+                        manifold.max_normal_impulse = max_normal_impulse;
                         manifold.points.iter_mut().for_each(|point| {
                             // Keep anchors but update separation. This eliminates jitter.
                             let r1 = delta_rot1 * point.anchor1;
@@ -814,6 +838,7 @@ impl<C: AnyCollider> NarrowPhase<'_, '_, C> {
                     // Set the initial surface properties.
                     manifold.friction = friction;
                     manifold.restitution = restitution;
+                    manifold.max_normal_impulse = max_normal_impulse;
                     #[cfg(feature = "2d")]
                     {
                         manifold.tangent_speed = 0.0;

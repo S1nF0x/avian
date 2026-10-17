@@ -9,7 +9,7 @@ use crate::{
 };
 use bevy::{platform::collections::HashSet, prelude::*};
 
-use super::{ContactEdge, ContactId};
+use super::{ContactEdge, ContactId, ContactManifold, ContactPairFlags};
 
 /// A resource that stores all [`ContactEdge`]s in the physics world in an [undirected graph](StableUnGraph),
 /// and their corresponding [`ContactPair`]s.
@@ -74,6 +74,12 @@ use super::{ContactEdge, ContactId};
 /// For filtering and modifying collisions, consider using [`CollisionHooks`] instead.
 #[derive(Resource, Clone, Debug, Default)]
 pub struct ContactGraph {
+    /// Physics-step revision of the last narrow-phase publication.
+    ///
+    /// Consumers that build asynchronous collider or render data can use this
+    /// to reject stale snapshots.
+    pub revision: u64,
+
     // TODO: Can and should edges be between bodies instead of colliders?
     // TODO: We could have a separate intersection graph for sensors.
     // TODO: Make the fields private, but expose a public API through methods.
@@ -241,6 +247,39 @@ impl ContactGraph {
                     .map(|pair| (edge, pair))
             }
         })
+    }
+
+    /// Replaces the manifolds for a contact that was refreshed by an external
+    /// narrow-phase or voxel backend.
+    ///
+    /// The returned value is the signed manifold-count delta. If the caller
+    /// changes the count during a solver substep, it should enqueue
+    /// [`ContactStatusChange::ManifoldCountChanged`](crate::collision::narrow_phase::ContactStatusChange::ManifoldCountChanged)
+    /// and then request the contact through
+    /// [`ContactReseolveQueue`](crate::dynamics::solver::ContactReseolveQueue).
+    ///
+    /// This method updates the touching flags but deliberately does not emit
+    /// collision messages or modify the constraint graph by itself.
+    #[inline]
+    pub fn replace_manifolds(
+        &mut self,
+        contact_id: ContactId,
+        manifolds: Vec<ContactManifold>,
+    ) -> Option<i16> {
+        let (edge, pair) = self.get_mut_by_id(contact_id)?;
+        let old_count = pair.manifolds.len() as i32;
+        let new_count = manifolds.len() as i32;
+        pair.manifolds = manifolds;
+        let manifold_count_change = (new_count - old_count) as i16;
+        // The caller receives the delta and is responsible for enqueueing the
+        // corresponding solver graph change. Do not leave it armed for the
+        // next narrow-phase pass, which would enqueue it a second time.
+        pair.manifold_count_change = 0;
+
+        let touching = new_count != 0;
+        pair.flags.set(ContactPairFlags::TOUCHING, touching);
+        edge.flags.set(ContactEdgeFlags::TOUCHING, touching);
+        Some(manifold_count_change)
     }
 
     /// Returns the [`ContactPair`] between two entities based on the [`ContactEdge`].

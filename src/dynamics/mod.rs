@@ -110,12 +110,14 @@ pub mod prelude {
             *,
         },
         solver::{
-            PhysicsLengthUnit, SolverPlugin, SolverPlugins,
+            ContactBreakEvent, ContactReseolveQueue, PhysicsLengthUnit, SolverConfig, SolverPlugin,
+            SolverPlugins,
             islands::{
                 IslandPlugin, IslandSleepingPlugin, SleepBody, SleepIslands, WakeBody, WakeIslands,
             },
             schedule::{
-                SolverSchedulePlugin, SolverSet, SolverSystems, SubstepCount, SubstepSchedule,
+                ContactBreakageSystems, SolverSchedulePlugin, SolverSet, SolverSystems,
+                SubstepCount, SubstepSchedule,
             },
             solver_body::SolverBodyPlugin,
         },

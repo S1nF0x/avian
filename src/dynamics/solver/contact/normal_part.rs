@@ -27,6 +27,11 @@ pub struct ContactNormalPart {
     /// a safe physics boundary; this method never mutates colliders.
     pub capacity_exceeded: bool,
 
+    /// The largest uncapped accumulated impulse requested by the current
+    /// solve. This is exposed for breakage diagnostics and is reset when a new
+    /// contact constraint is generated.
+    pub last_requested_impulse: f32,
+
     /// The total normal impulse applied across substeps and restitution.
     /// The unit is typically N⋅s or kg⋅m/s.
     ///
@@ -117,6 +122,7 @@ impl ContactNormalPart {
             impulse: warm_start_impulse.unwrap_or_default(),
             max_impulse: f32::INFINITY,
             capacity_exceeded: false,
+            last_requested_impulse: 0.0,
             total_impulse: 0.0,
             effective_mass: k.recip_or_zero(),
             softness,
@@ -160,6 +166,7 @@ impl ContactNormalPart {
     /// Clamp an actual accumulated constraint impulse. Shared by the normal
     /// solver and restitution, so neither can inject uncapped momentum.
     pub fn clamp_accumulated_impulse(&mut self, proposed: f32) -> f32 {
+        self.last_requested_impulse = self.last_requested_impulse.max(proposed);
         let new_impulse = proposed.max(0.0).min(self.max_impulse);
         if proposed.is_finite() && proposed > self.max_impulse {
             self.capacity_exceeded = true;
@@ -231,6 +238,7 @@ mod material_capacity_tests {
             impulse: warm_start,
             max_impulse: f32::INFINITY,
             capacity_exceeded: false,
+            last_requested_impulse: 0.0,
             total_impulse: 0.0,
             effective_mass: 2.0,
             softness: SoftnessCoefficients {

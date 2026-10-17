@@ -64,6 +64,9 @@ impl Plugin for SolverSchedulePlugin {
                         SubstepSolverSystems::SolveConstraints,
                         IntegrationSystems::Position,
                         SubstepSolverSystems::Relax,
+                        ContactBreakageSystems::Detect,
+                        ContactBreakageSystems::Apply,
+                        ContactBreakageSystems::ReSolve,
                         SubstepSolverSystems::Damping,
                     )
                         .chain(),
@@ -152,6 +155,23 @@ pub enum SubstepSolverSystems {
     Damping,
 }
 
+/// Extension points for material breakage and same-substep contact rebuilding.
+///
+/// The [`Detect`](Self::Detect) set emits [`ContactBreakEvent`] messages after
+/// the normal relaxation pass. Applications can update their voxel/material
+/// representation and call [`ContactReseolveQueue::request_contact`] from the
+/// [`Apply`](Self::Apply) set. Avian then rebuilds those contact constraints
+/// and performs a bounded re-solve in [`ReSolve`](Self::ReSolve).
+#[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ContactBreakageSystems {
+    /// Emits contact capacity failures detected by the solver.
+    Detect,
+    /// Applies user-owned material or topology changes.
+    Apply,
+    /// Rebuilds requested contacts and performs the bounded re-solve.
+    ReSolve,
+}
+
 /// A deprecated alias for [`SubstepSolverSystems`].
 #[deprecated(since = "0.4.0", note = "Renamed to `SubstepSolverSystems`")]
 pub type SubstepSolverSet = SubstepSolverSystems;
@@ -206,6 +226,9 @@ fn run_substep_schedule(world: &mut World) {
     let _ = world.try_schedule_scope(SubstepSchedule, |world, schedule| {
         for i in 0..substeps {
             trace!("running SubstepSchedule: {i}");
+            world
+                .resource_mut::<super::plugin::ContactReseolveQueue>()
+                .begin_substep();
             *world.resource_mut::<Time>() = world.resource::<Time<Substeps>>().as_generic();
             schedule.run(world);
         }
