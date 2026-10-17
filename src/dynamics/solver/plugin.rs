@@ -736,6 +736,10 @@ pub struct ContactBreakEvent {
     pub max_normal_impulse: f32,
     /// The largest requested normal impulse in the failed constraint points.
     pub requested_normal_impulse: f32,
+    /// The world-space direction and magnitude of the requested normal impulse.
+    ///
+    /// In 3D this can be fed directly into a fragment momentum transfer model.
+    pub requested_normal_impulse_vector: Vector,
 }
 
 /// The [`SoftnessCoefficients`] used for contacts.
@@ -1107,6 +1111,7 @@ fn emit_contact_break_events(
                 body2: contact_pair.body2,
                 max_normal_impulse,
                 requested_normal_impulse,
+                requested_normal_impulse_vector: constraint.normal * requested_normal_impulse,
             });
             emitted.push(constraint.contact_id);
             diagnostics.contact_break_event_count += 1;
