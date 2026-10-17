@@ -379,10 +379,12 @@ impl ContactConstraint {
             let mut impulse = -point.normal_part.effective_mass
                 * (normal_speed + self.restitution * point.normal_speed);
 
-            // Clamp the accumulated impulse.
-            let new_impulse = (point.normal_part.impulse + impulse).max(0.0);
-            impulse = new_impulse - point.normal_part.impulse;
-            point.normal_part.impulse = new_impulse;
+            // Restitution is a real solver impulse too. Apply exactly the
+            // same material capacity bound as the main velocity solve, so a
+            // broken pane cannot regain rigid-wall momentum in this pass.
+            impulse = point.normal_part.clamp_accumulated_impulse(
+                point.normal_part.impulse + impulse,
+            );
 
             // Add the incremental impulse instead of the full impulse because this is not a substep.
             point.normal_part.total_impulse += impulse;
