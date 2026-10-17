@@ -172,8 +172,89 @@ impl<C: AnyCollider> NarrowPhase<'_, '_, C> {
         for<'w, 's> SystemParamItem<'w, 's, H>: CollisionHooks,
     {
         // Update contacts for all contact pairs.
-        self.update_contacts::<H>(delta_secs, hooks, context, diagnostics, commands);
+        self.update_contacts::<H>(None, delta_secs, hooks, context, diagnostics, commands);
+        self.process_contact_status_changes(None, collision_started_writer, collision_ended_writer);
+    }
 
+    /// Recomputes actual narrow-phase manifolds for one contact after an
+    /// application changes that pair's collider geometry during a substep.
+    ///
+    /// This is intentionally local: unrelated contact pairs are not recomputed.
+    /// The method records contact-status changes for the solver to consume in
+    /// the same substep. Call it only after publishing the changed collider.
+    pub fn refresh_contact_pair<H: CollisionHooks>(
+        &mut self,
+        contact_id: ContactId,
+        collision_started_writer: &mut MessageWriter<CollisionStart>,
+        collision_ended_writer: &mut MessageWriter<CollisionEnd>,
+        delta_secs: f32,
+        hooks: &SystemParamItem<H>,
+        context: &SystemParamItem<C::Context>,
+        diagnostics: &mut CollisionDiagnostics,
+        commands: &mut ParallelCommands,
+    ) -> bool
+    where
+        for<'w, 's> SystemParamItem<'w, 's, H>: CollisionHooks,
+    {
+        let Some((collider1, collider2, body1, body2, was_touching, events_enabled, generates_constraints)) =
+            self.contact_graph.get_by_id(contact_id).map(|(edge, pair)| (
+                pair.collider1,
+                pair.collider2,
+                pair.body1,
+                pair.body2,
+                edge.is_touching(),
+                edge.events_enabled(),
+                pair.generates_constraints(),
+            ))
+        else {
+            return false;
+        };
+
+        // A voxel cut can retire a child collider entirely. Remove its graph
+        // edge and queue constraint removal rather than leaving a stale impulse.
+        if self.collider_query.get_many([collider1, collider2]).is_err() {
+            if was_touching && events_enabled {
+                collision_ended_writer.write(CollisionEnd {
+                    collider1,
+                    collider2,
+                    body1,
+                    body2,
+                });
+            }
+            Self::remove_colliding_entities(
+                &mut self.colliding_entities_query,
+                collider1,
+                collider2,
+            );
+            if generates_constraints
+                && let (Some(body1), Some(body2)) = (body1, body2)
+            {
+                self.contact_status_changes.push(
+                    ContactStatusChange::StoppedGeneratingConstraints {
+                        contact_id,
+                        body1,
+                        body2,
+                    },
+                );
+            }
+            self.contact_graph.remove_edge_by_id(
+                &PairKey::new(collider1.index_u32(), collider2.index_u32()),
+                contact_id,
+            );
+            return false;
+        }
+
+        self.update_contacts::<H>(Some(contact_id), delta_secs, hooks, context, diagnostics, commands);
+        self.process_contact_status_changes(Some(contact_id), collision_started_writer, collision_ended_writer);
+        self.contact_graph.get_by_id(contact_id).is_some()
+    }
+
+    fn process_contact_status_changes(
+        &mut self,
+        only_contact: Option<ContactId>,
+        collision_started_writer: &mut MessageWriter<CollisionStart>,
+        collision_ended_writer: &mut MessageWriter<CollisionEnd>,
+    ) {
         // Process contact status changes, iterating over set bits serially to maintain determinism.
         //
         // The narrow phase only updates the `ContactGraph` and records `ContactStatusChange`s.
@@ -185,6 +266,11 @@ impl<C: AnyCollider> NarrowPhase<'_, '_, C> {
             while bits != 0 {
                 let trailing_zeros = bits.trailing_zeros();
                 let contact_id = ContactId(i as u32 * 64 + trailing_zeros);
+
+                if only_contact.is_some_and(|target| target != contact_id) {
+                    bits &= bits - 1;
+                    continue;
+                }
 
                 let (contact_edge, contact_pair) = self
                     .contact_graph
@@ -387,6 +473,7 @@ impl<C: AnyCollider> NarrowPhase<'_, '_, C> {
     /// The order of contact pairs is preserved.
     fn update_contacts<H: CollisionHooks>(
         &mut self,
+        only_contact: Option<ContactId>,
         delta_secs: f32,
         hooks: &SystemParamItem<H>,
         collider_context: &SystemParamItem<C::Context>,
@@ -439,6 +526,9 @@ impl<C: AnyCollider> NarrowPhase<'_, '_, C> {
         //       and to chunk it into smaller bit vectors for each thread. Might not be any faster though.
         crate::utils::par_for_each(self.contact_graph.active_pairs_mut(), 64, |_i, contacts| {
             let contact_id = contacts.contact_id.0 as usize;
+            if only_contact.is_some_and(|target| target.0 as usize != contact_id) {
+                return;
+            }
 
             #[cfg(not(feature = "parallel"))]
             let contact_status_bits = &mut self.contact_status_bits;
