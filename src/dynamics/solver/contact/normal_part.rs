@@ -139,6 +139,24 @@ impl ContactNormalPart {
         self.impulse = self.impulse.clamp(0.0, self.max_impulse);
     }
 
+    /// Returns the *applied* warm-start normal impulse. Scaling a cached
+    /// impulse must not bypass a breakable material's contact capacity.
+    ///
+    /// Ordinary, unbounded contacts retain the original warm-start behavior.
+    /// This does not change the accumulated impulse stored for the solve.
+    pub fn warm_start_impulse(&self, coefficient: f32) -> f32 {
+        let scaled = coefficient * self.impulse;
+        if self.max_impulse.is_finite() {
+            if scaled.is_finite() {
+                scaled.clamp(0.0, self.max_impulse)
+            } else {
+                0.0
+            }
+        } else {
+            scaled
+        }
+    }
+
     /// Clamp an actual accumulated constraint impulse. Shared by the normal
     /// solver and restitution, so neither can inject uncapped momentum.
     pub fn clamp_accumulated_impulse(&mut self, proposed: f32) -> f32 {
@@ -247,9 +265,23 @@ mod material_capacity_tests {
     }
 
     #[test]
+    fn capped_warm_start_cannot_apply_more_than_the_material_capacity() {
+        let mut normal = part(4.0);
+        normal.set_maximum_normal_impulse(5.0);
+        assert_eq!(normal.warm_start_impulse(2.0), 5.0);
+        assert_eq!(normal.warm_start_impulse(0.5), 2.0);
+        assert_eq!(normal.impulse, 4.0);
+
+        normal.set_maximum_normal_impulse(0.0);
+        assert_eq!(normal.warm_start_impulse(2.0), 0.0);
+        assert_eq!(normal.warm_start_impulse(f32::NAN), 0.0);
+    }
+
+    #[test]
     fn ordinary_contacts_are_unbounded() {
         let mut normal = part(0.0);
         assert_eq!(normal.clamp_accumulated_impulse(123.0), 123.0);
+        assert_eq!(normal.warm_start_impulse(2.0), 246.0);
         assert!(!normal.capacity_exceeded);
     }
 }

@@ -16,6 +16,33 @@ use bevy::reflect::{ReflectDeserialize, ReflectSerialize};
 use bevy::{reflect::Reflect, utils::default};
 
 use super::solver_body::{SolverBody, SolverBodyIndex, SolverBodyInertia};
+use tangent_part::TangentImpulse;
+
+/// Clamp the *applied* cached friction to the Coulomb limit of a capped
+/// normal contact. Leave ordinary contacts' existing warm start unchanged.
+#[inline]
+fn warm_start_tangent_impulse(
+    cached: TangentImpulse,
+    coefficient: f32,
+    friction: f32,
+    applied_normal_impulse: f32,
+    limited: bool,
+) -> TangentImpulse {
+    let impulse = coefficient * cached;
+    if !limited {
+        return impulse;
+    }
+
+    let limit = friction.max(0.0) * applied_normal_impulse;
+    #[cfg(feature = "2d")]
+    {
+        impulse.clamp(-limit, limit)
+    }
+    #[cfg(feature = "3d")]
+    {
+        impulse.clamp_length_max(limit)
+    }
+}
 
 // TODO: One-body constraint version
 /// Data and logic for solving a single contact point for a [`ContactConstraint`].
@@ -231,20 +258,24 @@ impl ContactConstraint {
             let r1 = point.anchor1;
             let r2 = point.anchor2;
 
-            let tangent_impulse = point
-                .tangent_part
-                .as_ref()
-                .map_or(default(), |part| part.impulse);
+            let normal_impulse = point
+                .normal_part
+                .warm_start_impulse(warm_start_coefficient);
+            let tangent_impulse = warm_start_tangent_impulse(
+                point.tangent_part.as_ref().map_or(default(), |part| part.impulse),
+                warm_start_coefficient,
+                self.friction,
+                normal_impulse,
+                point.normal_part.max_impulse.is_finite(),
+            );
 
             #[cfg(feature = "2d")]
-            let p = warm_start_coefficient
-                * (point.normal_part.impulse * self.normal
-                    + tangent_impulse * tangent_directions[0]);
+            let p = normal_impulse * self.normal
+                + tangent_impulse * tangent_directions[0];
             #[cfg(feature = "3d")]
-            let p = warm_start_coefficient
-                * (point.normal_part.impulse * self.normal
-                    + tangent_impulse.x * tangent_directions[0]
-                    + tangent_impulse.y * tangent_directions[1]);
+            let p = normal_impulse * self.normal
+                + tangent_impulse.x * tangent_directions[0]
+                + tangent_impulse.y * tangent_directions[1];
 
             body1.linear_velocity -= p * inv_mass1;
             body1.angular_velocity -= inv_angular_inertia1 * cross(r1, p);
@@ -439,5 +470,35 @@ fn compute_tangent_directions(
             .unwrap_or(force_direction.any_orthonormal_vector());
         let bitangent = force_direction.cross(tangent);
         [tangent, bitangent]
+    }
+}
+
+#[cfg(test)]
+mod material_warm_start_tests {
+    use super::*;
+
+    #[cfg(feature = "2d")]
+    #[test]
+    fn capped_2d_friction_warm_start_respects_applied_normal_impulse() {
+        assert_eq!(warm_start_tangent_impulse(10.0, 2.0, 0.5, 4.0, true), 2.0);
+        assert_eq!(warm_start_tangent_impulse(-10.0, 2.0, 0.5, 4.0, true), -2.0);
+        assert_eq!(warm_start_tangent_impulse(10.0, 2.0, 0.5, 0.0, true), 0.0);
+        assert_eq!(warm_start_tangent_impulse(10.0, 2.0, 0.5, 4.0, false), 20.0);
+    }
+
+    #[cfg(feature = "3d")]
+    #[test]
+    fn capped_3d_friction_warm_start_respects_applied_normal_impulse() {
+        let cached = bevy_math::Vec2::new(3.0, 4.0);
+        let capped = warm_start_tangent_impulse(cached, 2.0, 0.5, 4.0, true);
+        assert!((capped.length() - 2.0).abs() < 1.0e-5);
+        assert_eq!(
+            warm_start_tangent_impulse(cached, 2.0, 0.5, 0.0, true),
+            bevy_math::Vec2::ZERO
+        );
+        assert_eq!(
+            warm_start_tangent_impulse(cached, 2.0, 0.5, 4.0, false),
+            cached * 2.0
+        );
     }
 }
