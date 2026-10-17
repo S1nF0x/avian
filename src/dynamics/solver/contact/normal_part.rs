@@ -15,6 +15,18 @@ pub struct ContactNormalPart {
     /// The magnitude of the contact impulse along the contact normal.
     pub impulse: f32,
 
+    /// Optional capacity for the accumulated normal constraint impulse (N*s).
+    /// Defaults to infinity. A material solver can configure this just after
+    /// contact constraint generation and before warm starting. Unlike scaling
+    /// effective_mass, this bound is enforced on the actual solver impulse,
+    /// including relaxation and restitution.
+    pub max_impulse: f32,
+
+    /// True once the unconstrained solver requested more impulse than the
+    /// configured capacity. Caller may defer a material topology change to
+    /// a safe physics boundary; this method never mutates colliders.
+    pub capacity_exceeded: bool,
+
     /// The total normal impulse applied across substeps and restitution.
     /// The unit is typically N⋅s or kg⋅m/s.
     ///
@@ -103,10 +115,40 @@ impl ContactNormalPart {
 
         Self {
             impulse: warm_start_impulse.unwrap_or_default(),
+            max_impulse: f32::INFINITY,
+            capacity_exceeded: false,
             total_impulse: 0.0,
             effective_mass: k.recip_or_zero(),
             softness,
         }
+    }
+
+    /// Configure a physical contact impulse ceiling without altering the
+    /// effective mass tensor. Call before warm starting the constraint.
+    ///
+    /// Reconfiguring the capacity after impulses have already been applied
+    /// cannot undo them; consumers must not change this during a solve.
+    pub fn set_maximum_normal_impulse(&mut self, max_impulse_ns: f32) {
+        self.max_impulse = if max_impulse_ns.is_finite() {
+            max_impulse_ns.max(0.0)
+        } else {
+            f32::INFINITY
+        };
+        // Warm-start values from a stronger previous contact are not allowed
+        // to bypass the new material constraint.
+        self.impulse = self.impulse.clamp(0.0, self.max_impulse);
+    }
+
+    /// Clamp an actual accumulated constraint impulse. Shared by the normal
+    /// solver and restitution, so neither can inject uncapped momentum.
+    pub fn clamp_accumulated_impulse(&mut self, proposed: f32) -> f32 {
+        let new_impulse = proposed.max(0.0).min(self.max_impulse);
+        if proposed.is_finite() && proposed > self.max_impulse {
+            self.capacity_exceeded = true;
+        }
+        let applied_delta = new_impulse - self.impulse;
+        self.impulse = new_impulse;
+        applied_delta
     }
 
     /// Solves the non-penetration constraint, updating the total impulse in `self` and returning
@@ -152,13 +194,62 @@ impl ContactNormalPart {
             -self.effective_mass * normal_speed
         };
 
-        // Clamp the accumulated impulse.
-        let new_impulse = (self.impulse + impulse).max(0.0);
-        impulse = new_impulse - self.impulse;
-        self.impulse = new_impulse;
-        self.total_impulse += new_impulse;
+        // Enforce the real normal impulse bound in the velocity solve, not
+        // via a fabricated effective mass or post-solver velocity refund.
+        impulse = self.clamp_accumulated_impulse(self.impulse + impulse);
+        self.total_impulse += self.impulse;
 
         // Return the clamped incremental normal impulse.
         impulse
+    }
+}
+
+#[cfg(test)]
+mod material_capacity_tests {
+    use super::*;
+
+    fn part(warm_start: f32) -> ContactNormalPart {
+        ContactNormalPart {
+            impulse: warm_start,
+            max_impulse: f32::INFINITY,
+            capacity_exceeded: false,
+            total_impulse: 0.0,
+            effective_mass: 2.0,
+            softness: SoftnessCoefficients {
+                bias: 0.0,
+                impulse_scale: 0.0,
+                mass_scale: 1.0,
+            },
+        }
+    }
+
+    #[test]
+    fn actual_normal_impulse_is_clamped_but_effective_mass_is_not_changed() {
+        let mut normal = part(0.0);
+        normal.set_maximum_normal_impulse(5.0);
+        let applied = normal.solve_impulse::<false>(
+            0.0, Vector::splat(-10.0), Vector::X, 0.0, 1.0 / 60.0,
+        );
+        assert_eq!(applied, 5.0);
+        assert_eq!(normal.impulse, 5.0);
+        assert_eq!(normal.effective_mass, 2.0);
+        assert!(normal.capacity_exceeded);
+        assert_eq!(normal.clamp_accumulated_impulse(20.0), 0.0);
+    }
+
+    #[test]
+    fn warm_start_cannot_bypass_new_capacity() {
+        let mut normal = part(80.0);
+        normal.set_maximum_normal_impulse(3.0);
+        assert_eq!(normal.impulse, 3.0);
+        assert_eq!(normal.clamp_accumulated_impulse(4.0), 0.0);
+        assert!(normal.capacity_exceeded);
+    }
+
+    #[test]
+    fn ordinary_contacts_are_unbounded() {
+        let mut normal = part(0.0);
+        assert_eq!(normal.clamp_accumulated_impulse(123.0), 123.0);
+        assert!(!normal.capacity_exceeded);
     }
 }
