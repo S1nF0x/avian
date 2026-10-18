@@ -363,10 +363,9 @@ fn finish_optimize_trees(
             // AABBs while the snapshot was optimized, so rebase those changes
             // only when the live AABB revision differs from the snapshot.
             if collider_tree.aabb_revision != tree.aabb_revision {
-                let current_aabbs = (0..collider_tree.proxies.len())
-                    .filter_map(|index| {
+                let current_aabbs = collider_tree.proxies.iter()
+                    .filter_map(|(index, _)| {
                         let proxy_id = ProxyId::new(index as u32);
-                        collider_tree.get_proxy(proxy_id)?;
                         Some((proxy_id, collider_tree.get_proxy_aabb(proxy_id)?))
                     })
                     .collect::<Vec<_>>();
