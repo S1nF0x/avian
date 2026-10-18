@@ -1591,3 +1591,34 @@ fn inverse_on_free_axes(inv_inertia: SymmetricTensor) -> SymmetricTensor {
     ));
     (inv_inertia + locked).inverse_or_zero() - locked
 }
+
+#[cfg(all(test, feature = "3d"))]
+mod fracture_contact_lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn removed_contact_is_pruned_before_solver_impulse_writeback() {
+        let empty_graph = ContactGraph::default();
+        let mut constraints = ConstraintGraph::default();
+        constraints.colors[0].contact_constraints.push(ContactConstraint {
+            body_index1: SolverBodyIndex::INVALID,
+            body_index2: SolverBodyIndex::INVALID,
+            relative_dominance: 0,
+            friction: 0.0,
+            restitution: 0.0,
+            tangent_velocity: Vector::ZERO,
+            normal: Vector::Y,
+            tangent1: Vector::X,
+            points: Vec::new(),
+            contact_id: ContactId(38),
+            manifold_index: 0,
+        });
+
+        assert_eq!(
+            prune_orphaned_contact_constraints(&empty_graph, &mut constraints),
+            1,
+            "retired fracture manifold must not survive to impulse writeback",
+        );
+        assert!(constraints.colors[0].contact_constraints.is_empty());
+    }
+}
