@@ -226,6 +226,13 @@ pub fn apply_contact_status_changes(
         );
     }
 
+    // A topology edit can retire a contact during the same substep.
+    // Removing its graph manifold handle does not remove its already-built
+    // solver constraint. Purge orphaned constraints BEFORE restitution;
+    // otherwise stale impulses will act on bodies after the cut and the
+    // later warm-start writeback will reference a missing manifold.
+    prune_orphaned_contact_constraints(&contact_graph, &mut constraint_graph);
+
     if !islands_to_wake.is_empty() {
         islands_to_wake.sort_unstable();
         islands_to_wake.dedup();
@@ -1412,6 +1419,29 @@ fn solve_restitution_internal(
     }
 }
 
+/// Drop solved constraints whose original contact pair or manifold no longer
+/// exists after a same-substep topology edit. These are derived cache entries,
+/// not physical contacts, and must never survive removal of their geometry.
+fn prune_orphaned_contact_constraints(
+    contact_graph: &ContactGraph,
+    constraint_graph: &mut ConstraintGraph,
+) -> usize {
+    let mut pruned = 0usize;
+    for color in &mut constraint_graph.colors {
+        color.contact_constraints.retain(|constraint| {
+            let valid = contact_graph
+                .get_by_id(constraint.contact_id)
+                .and_then(|(_, pair)| pair.manifolds.get(constraint.manifold_index))
+                .is_some();
+            if !valid {
+                pruned += 1;
+            }
+            valid
+        });
+    }
+    pruned
+}
+
 /// Copies contact impulses from [`ContactConstraints`] to the contacts in the [`ContactGraph`].
 /// They will be used for [warm starting](SubstepSolverSystems::WarmStart).
 fn store_contact_impulses(
@@ -1421,16 +1451,21 @@ fn store_contact_impulses(
 ) {
     let start = crate::utils::Instant::now();
 
+    // The substep re-solve has a finite pass budget. If the final cut retired
+    // a pair after that budget was exhausted, its old constraint can still
+    // reach this phase. Reconcile against the authoritative contact graph
+    // rather than treating a physically valid removed contact as impossible.
+    prune_orphaned_contact_constraints(&contact_graph, &mut constraint_graph);
+
     for color in constraint_graph.colors.iter_mut() {
         for constraint in &mut color.contact_constraints {
             let Some(manifold) = contact_graph.get_manifold_mut(ContactManifoldHandle {
                 contact_id: constraint.contact_id,
                 manifold_index: constraint.manifold_index,
             }) else {
-                unreachable!(
-                    "Contact manifold {:?} for contact ID {:?} not found in contact graph.",
-                    constraint.contact_id, constraint.manifold_index
-                );
+                // This contact no longer exists; it cannot receive a
+                // warm-start impulse for the following physics step.
+                continue;
             };
 
             for (contact, constraint_point) in
