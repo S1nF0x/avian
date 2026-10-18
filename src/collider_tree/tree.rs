@@ -32,6 +32,10 @@ pub struct ColliderTree {
     pub moved_proxies: MovedProxyList,
     /// A workspace for reusing allocations across tree operations.
     pub workspace: ColliderTreeWorkspace,
+    /// Changes to the live proxy set or AABBs invalidate an asynchronous BVH
+    /// optimization snapshot. This prevents a stale optimized tree from being
+    /// installed after fracture removes or replaces collider proxies.
+    pub(crate) mutation_revision: u64,
 }
 
 /// A set of [`ProxyId`]s that have moved since the last update, in insertion order.
@@ -217,6 +221,11 @@ impl Clone for ColliderTreeWorkspace {
 }
 
 impl ColliderTree {
+    #[inline]
+    fn mark_mutated(&mut self) {
+        self.mutation_revision = self.mutation_revision.wrapping_add(1);
+    }
+
     /// Adds a proxy to the tree, returning its index.
     #[inline]
     pub fn add_proxy(&mut self, aabb: Aabb, proxy: ColliderTreeProxy) -> ProxyId {
@@ -227,6 +236,7 @@ impl ColliderTree {
 
         // Add to moved proxies.
         self.moved_proxies.push(ProxyId::new(id));
+        self.mark_mutated();
 
         ProxyId::new(id)
     }
@@ -242,6 +252,7 @@ impl ColliderTree {
 
             // Remove from moved proxies.
             self.moved_proxies.remove(proxy_id);
+            self.mark_mutated();
 
             Some(proxy)
         } else {
@@ -321,6 +332,7 @@ impl ColliderTree {
 
         // Update the proxy's AABB in the BVH.
         self.bvh.nodes[node_index].set_aabb(aabb);
+        self.mark_mutated();
     }
 
     /// Resizes the AABB of a proxy in the tree.
@@ -334,6 +346,7 @@ impl ColliderTree {
     pub fn resize_proxy_aabb(&mut self, proxy_id: ProxyId, aabb: Aabb) {
         let node_index = self.bvh.primitives_to_nodes[proxy_id.index()] as usize;
         self.bvh.resize_node(node_index, aabb);
+        self.mark_mutated();
     }
 
     /// Updates the AABB of a proxy and reinserts it at an optimal place in the tree.
@@ -343,6 +356,7 @@ impl ColliderTree {
         let node_id = self.bvh.primitives_to_nodes[proxy_id.index()];
         self.bvh.resize_node(node_id as usize, aabb);
         self.bvh.reinsert_node(node_id as usize);
+        self.mark_mutated();
     }
 
     /// Refits the entire tree from the leaves up.
