@@ -261,7 +261,7 @@ fn optimize_trees(
                 // These are not needed during the simulation step.
                 moved_proxies: core::mem::take(&mut tree.moved_proxies),
                 workspace: core::mem::take(&mut tree.workspace),
-                mutation_revision: tree.mutation_revision,
+                topology_revision: tree.topology_revision,
             };
 
             optimization_tasks.jobs.push(Arc::new(OptimizationJob {
@@ -356,9 +356,24 @@ fn finish_optimize_trees(
     for job in jobs {
         let mut tree = job.tree.lock().unwrap_or_else(|err| err.into_inner());
         let collider_tree = collider_trees.tree_for_type_mut(job.tree_type);
-        if collider_tree.mutation_revision == tree.mutation_revision {
-            // No live proxy or AABB changed while the snapshot was optimized.
+        if collider_tree.topology_revision == tree.topology_revision {
+            // The proxy set is unchanged. Preserve the current live AABBs,
+            // install the optimized topology, then rebase/refit the leaves.
+            // Moving bodies may have updated AABBs while the snapshot was
+            // optimized; those changes must not be lost or trigger a stale
+            // broad-phase bound.
+            let current_aabbs = (0..collider_tree.proxies.len())
+                .filter_map(|index| {
+                    let proxy_id = ProxyId::new(index as u32);
+                    collider_tree.get_proxy(proxy_id)?;
+                    Some((proxy_id, collider_tree.get_proxy_aabb(proxy_id)?))
+                })
+                .collect::<Vec<_>>();
             collider_tree.bvh = core::mem::take(&mut tree.bvh);
+            for (proxy_id, aabb) in current_aabbs {
+                collider_tree.set_proxy_aabb(proxy_id, aabb);
+            }
+            collider_tree.refit_all();
         } else {
             // A substep fracture changed the live tree after the snapshot was
             // cloned. Its BVH already contains those add/remove/AABB edits;
