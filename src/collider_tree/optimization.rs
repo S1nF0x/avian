@@ -3,6 +3,7 @@ use crate::data_structures::stable_vec::StableVec;
 use crate::{
     collider_tree::{
         ColliderTree, ColliderTreeDiagnostics, ColliderTreeSystems, ColliderTreeType, ColliderTrees,
+        ProxyId,
     },
     prelude::*,
 };
