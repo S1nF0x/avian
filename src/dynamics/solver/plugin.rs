@@ -631,6 +631,36 @@ impl Default for SolverConfig {
     }
 }
 
+/// One generation-tagged authorization to make a fracture contact observe
+/// newly published collider geometry. Staging a ticket NEVER invalidates
+/// the load-bearing manifold. A stale ticket from an earlier substep cannot
+/// acknowledge a newer contact with a reused ContactId.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FractureCommitTicket {
+    contact_id: ContactId,
+    generation: u64,
+}
+
+impl FractureCommitTicket {
+    /// The contact pair for which a fracture publication was staged.
+    pub const fn contact_id(self) -> ContactId {
+        self.contact_id
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FracturePublication {
+    Awaiting,
+    Published,
+    Rejected,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StagedFractureContact {
+    ticket: FractureCommitTicket,
+    publication: FracturePublication,
+}
+
 /// A request to rebuild one or more contact constraints during the current
 /// substep.
 ///
@@ -646,9 +676,102 @@ pub struct ContactReseolveQueue {
     passes_this_substep: u8,
     prepared: bool,
     dropped_this_substep: bool,
+    /// A fracture is provisional until the owner has applied its exact
+    /// volume edit AND published the corresponding collider. Unknown or
+    /// rejected tickets are rebuilt against the original load-bearing
+    /// manifold, never marked as published by the solver.
+    staged_fractures: Vec<StagedFractureContact>,
+    next_fracture_generation: u64,
+    unconfirmed_fractures_this_step: u32,
 }
 
 impl ContactReseolveQueue {
+    /// Stage a potential fracture from a solver-confirmed yield event.
+    /// No new contact state is visible from this call alone.
+    ///
+    /// The owner must call `acknowledge_fracture_publication` after the
+    /// exact collider swap and narrow-phase refresh, or
+    /// `reject_fracture_publication` if validation/publication fails.
+    /// Unacknowledged tickets are conservatively rejected at the substep's
+    /// re-solve barrier.
+    pub fn stage_fracture_contact(&mut self, contact_id: ContactId) -> FractureCommitTicket {
+        if let Some(previous) = self.staged_fractures.iter()
+            .find(|entry| entry.ticket.contact_id == contact_id)
+        {
+            return previous.ticket;
+        }
+        self.next_fracture_generation =
+            self.next_fracture_generation.wrapping_add(1).max(1);
+        let ticket = FractureCommitTicket {
+            contact_id,
+            generation: self.next_fracture_generation,
+        };
+        self.staged_fractures.push(StagedFractureContact {
+            ticket,
+            publication: FracturePublication::Awaiting,
+        });
+        ticket
+    }
+
+    /// Acknowledge only after the authoritative resident material cut,
+    /// collider publication, and narrow-phase contact refresh all succeeded.
+    /// The caller (not Avian) owns that geometry proof. Returns false for a
+    /// stale ticket, an already rejected fracture or duplicate acknowledgement.
+    pub fn acknowledge_fracture_publication(
+        &mut self,
+        ticket: FractureCommitTicket,
+    ) -> bool {
+        let Some(entry) = self.staged_fractures.iter_mut()
+            .find(|entry| entry.ticket == ticket)
+        else { return false };
+        if entry.publication != FracturePublication::Awaiting {
+            return false;
+        }
+        entry.publication = FracturePublication::Published;
+        self.request_contact(ticket.contact_id);
+        true
+    }
+
+    /// Reject a fracture whose authoritative material edit or collider
+    /// publication was deferred/failed. The solver will rebuild its still
+    /// present contact at ordinary load-bearing capacity and re-solve.
+    /// This does not falsely claim that earlier provisional impulses were
+    /// rolled back; doing that would require replaying the entire substep.
+    pub fn reject_fracture_publication(
+        &mut self,
+        ticket: FractureCommitTicket,
+    ) -> bool {
+        let Some(entry) = self.staged_fractures.iter_mut()
+            .find(|entry| entry.ticket == ticket)
+        else { return false };
+        if entry.publication != FracturePublication::Awaiting {
+            return false;
+        }
+        entry.publication = FracturePublication::Rejected;
+        self.request_contact(ticket.contact_id);
+        true
+    }
+
+    /// End the publication barrier before any constraints are rebuilt.
+    /// Unresolved tickets fall back to their intact contact. All variants
+    /// request the same bounded re-solve; ONLY a successful published
+    /// ticket is allowed to use a refreshed narrow-phase manifold.
+    fn seal_fracture_barrier(&mut self) {
+        let mut pending = core::mem::take(&mut self.staged_fractures);
+        for entry in &mut pending {
+            if entry.publication == FracturePublication::Awaiting {
+                entry.publication = FracturePublication::Rejected;
+                self.unconfirmed_fractures_this_step =
+                    self.unconfirmed_fractures_this_step.saturating_add(1);
+            }
+            self.request_contact(entry.ticket.contact_id);
+        }
+    }
+
+    fn take_unconfirmed_fractures(&mut self) -> u32 {
+        core::mem::take(&mut self.unconfirmed_fractures_this_step)
+    }
+
     /// Requests a bounded re-solve for one contact pair.
     #[inline]
     pub fn request_contact(&mut self, contact_id: ContactId) {
@@ -677,12 +800,18 @@ impl ContactReseolveQueue {
     }
 
     pub(crate) fn begin_substep(&mut self) {
+        // The previous substep must not leak contact authorizations. The
+        // re-solve barrier normally consumes all staged entries, but an
+        // interrupted custom schedule cannot reuse their generations.
+        self.staged_fractures.clear();
         self.passes_this_substep = 0;
         self.prepared = false;
         self.dropped_this_substep = false;
+        self.unconfirmed_fractures_this_step = 0;
     }
 
     fn take_for_rebuild(&mut self, max_passes: u8) -> Option<Option<Vec<ContactId>>> {
+        self.seal_fracture_barrier();
         if !self.pending_all && self.pending.is_empty() {
             return None;
         }
@@ -714,6 +843,7 @@ impl ContactReseolveQueue {
         self.pending.clear();
         self.pending_all = false;
         self.prepared = false;
+        self.staged_fractures.clear();
     }
 
     fn take_dropped(&mut self) -> bool {
@@ -983,6 +1113,8 @@ fn rebuild_requested_contact_constraints(
         );
     }
 
+    diagnostics.contact_fracture_unconfirmed +=
+        re_solve_queue.take_unconfirmed_fractures();
     if re_solve_queue.take_dropped() {
         diagnostics.contact_re_solve_dropped += 1;
     }
@@ -1567,6 +1699,49 @@ pub fn joint_damping<T: Component + EntityConstraint<2>>(
 #[cfg(test)]
 mod contact_re_solve_tests {
     use super::*;
+
+    #[test]
+    fn unconfirmed_fracture_is_automatically_restored_for_same_substep_resolve() {
+        let mut queue = ContactReseolveQueue::default();
+        queue.begin_substep();
+        let ticket = queue.stage_fracture_contact(ContactId(17));
+        assert_eq!(ticket.contact_id(), ContactId(17));
+        assert_eq!(queue.pending_contact_count(), 0);
+        let rebuild = queue.take_for_rebuild(2).unwrap().unwrap();
+        assert_eq!(rebuild, vec![ContactId(17)]);
+        assert_eq!(queue.take_unconfirmed_fractures(), 1);
+        assert!(!queue.acknowledge_fracture_publication(ticket));
+        assert!(!queue.reject_fracture_publication(ticket));
+    }
+
+    #[test]
+    fn a_published_fracture_is_admitted_exactly_once() {
+        let mut queue = ContactReseolveQueue::default();
+        queue.begin_substep();
+        let ticket = queue.stage_fracture_contact(ContactId(9));
+        assert_eq!(queue.stage_fracture_contact(ContactId(9)), ticket);
+        assert!(queue.acknowledge_fracture_publication(ticket));
+        assert!(!queue.acknowledge_fracture_publication(ticket));
+        assert!(!queue.reject_fracture_publication(ticket));
+        assert_eq!(queue.take_for_rebuild(1).unwrap().unwrap(), vec![ContactId(9)]);
+        assert_eq!(queue.take_unconfirmed_fractures(), 0);
+    }
+
+    #[test]
+    fn rejected_or_old_ticket_cannot_authorize_a_reused_contact_id() {
+        let mut queue = ContactReseolveQueue::default();
+        queue.begin_substep();
+        let ticket = queue.stage_fracture_contact(ContactId(23));
+        assert!(queue.reject_fracture_publication(ticket));
+        assert!(!queue.acknowledge_fracture_publication(ticket));
+        assert_eq!(queue.take_for_rebuild(2).unwrap().unwrap(), vec![ContactId(23)]);
+        queue.begin_substep();
+        let new_ticket = queue.stage_fracture_contact(ContactId(23));
+        assert_ne!(ticket, new_ticket);
+        assert!(!queue.acknowledge_fracture_publication(ticket));
+        assert!(queue.acknowledge_fracture_publication(new_ticket));
+        assert_eq!(queue.take_for_rebuild(2).unwrap().unwrap(), vec![ContactId(23)]);
+    }
 
     #[test]
     fn contact_re_solve_requests_are_bounded_per_substep() {
