@@ -669,6 +669,8 @@ struct StagedFractureContact {
 /// manifolds, and then request only the contact IDs whose constraints became
 /// stale. Requests are consumed by the [`ContactBreakageSystems::ReSolve`]
 /// set and are bounded by [`SolverConfig::contact_re_solve_max_passes`].
+const MAX_PENDING_CONTACT_REBUILDS: usize = 1024;
+
 #[derive(Resource, Debug, Default)]
 pub struct ContactReseolveQueue {
     pending: Vec<ContactId>,
@@ -776,6 +778,14 @@ impl ContactReseolveQueue {
     #[inline]
     pub fn request_contact(&mut self, contact_id: ContactId) {
         if !self.pending_all && !self.pending.contains(&contact_id) {
+            if self.pending.len() >= MAX_PENDING_CONTACT_REBUILDS {
+                // Preserve the intact manifold and let the owning gameplay
+                // system retry on the next substep. A contact rebuild is a
+                // bounded optimization; it must never become an unbounded
+                // allocation path under a pathological contact graph.
+                self.dropped_this_substep = true;
+                return;
+            }
             self.pending.push(contact_id);
         }
     }
@@ -1181,7 +1191,8 @@ fn re_solve_requested_contacts(
     }
 
     for color in constraint_graph
-        .colors
+    
+    .colors
         .iter_mut()
         .take(COLOR_OVERFLOW_INDEX)
         .filter(|color| !color.contact_constraints.is_empty())
@@ -1797,3 +1808,4 @@ mod fracture_contact_lifecycle_tests {
         assert!(constraints.colors[0].contact_constraints.is_empty());
     }
 }
+
