@@ -345,9 +345,14 @@ impl<C: AnyCollider> NarrowPhase<'_, '_, C> {
                     );
 
                     contact_edge.flags.set(ContactEdgeFlags::TOUCHING, true);
+                    // Clear both edge transition flags; otherwise the same
+                    // contact may be scheduled twice on a later substep.
                     contact_pair
                         .flags
                         .set(ContactPairFlags::STARTED_TOUCHING, false);
+                    contact_pair
+                        .flags
+                        .set(ContactPairFlags::STARTED_GENERATING_CONSTRAINTS, false);
 
                     if contact_pair.generates_constraints() {
                         self.contact_status_changes.push(
@@ -381,6 +386,8 @@ impl<C: AnyCollider> NarrowPhase<'_, '_, C> {
                     );
 
                     contact_edge.flags.set(ContactEdgeFlags::TOUCHING, false);
+                    // Clear the ended-touch flag before queuing the current
+                    // loss of the contact constraint.
                     contact_pair
                         .flags
                         .set(ContactPairFlags::STOPPED_TOUCHING, false);
