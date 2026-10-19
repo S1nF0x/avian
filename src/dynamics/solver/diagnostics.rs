@@ -45,6 +45,9 @@ pub struct SolverDiagnostics {
     pub contact_re_solve: Duration,
     /// The number of re-solve requests dropped after reaching the pass limit.
     pub contact_re_solve_dropped: u32,
+    /// Fracture tickets not confirmed before the same-substep collider
+    /// publication barrier. Their original contact must remain load-bearing.
+    pub contact_fracture_unconfirmed: u32,
 }
 
 impl PhysicsDiagnostics for SolverDiagnostics {
@@ -81,6 +84,10 @@ impl PhysicsDiagnostics for SolverDiagnostics {
         (
             Self::CONTACT_RE_SOLVE_DROPPED,
             self.contact_re_solve_dropped,
+        ),
+        (
+            Self::CONTACT_FRACTURE_UNCONFIRMED,
+            self.contact_fracture_unconfirmed,
         )]
     }
 }
@@ -103,5 +110,6 @@ impl_diagnostic_paths! {
         CONTACT_RE_SOLVE_COUNT: "avian/solver/contact_re_solve_count",
         CONTACT_RE_SOLVE: "avian/solver/contact_re_solve",
         CONTACT_RE_SOLVE_DROPPED: "avian/solver/contact_re_solve_dropped",
+        CONTACT_FRACTURE_UNCONFIRMED: "avian/solver/contact_fracture_unconfirmed",
     }
 }

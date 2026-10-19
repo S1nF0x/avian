@@ -110,7 +110,8 @@ pub mod prelude {
             *,
         },
         solver::{
-            ContactBreakEvent, ContactReseolveQueue, PhysicsLengthUnit, SolverConfig, SolverPlugin,
+            ContactBreakEvent, ContactReseolveQueue, FractureCommitTicket,
+            PhysicsLengthUnit, SolverConfig, SolverPlugin,
             SolverPlugins,
             islands::{
                 IslandPlugin, IslandSleepingPlugin, SleepBody, SleepIslands, WakeBody, WakeIslands,
