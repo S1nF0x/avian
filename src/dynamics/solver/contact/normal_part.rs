@@ -151,6 +151,9 @@ impl ContactNormalPart {
     /// Ordinary, unbounded contacts retain the original warm-start behavior.
     /// This does not change the accumulated impulse stored for the solve.
     pub fn warm_start_impulse(&self, coefficient: f32) -> f32 {
+        if !coefficient.is_finite() {
+            return 0.0;
+        }
         let scaled = coefficient * self.impulse;
         if self.max_impulse.is_finite() {
             if scaled.is_finite() {
@@ -190,6 +193,15 @@ impl ContactNormalPart {
         let normal_speed = relative_velocity.dot(normal);
 
         // Compute the incremental normal impulse.
+        // The speculative branch divides by the step duration. Keep the
+        // public solver primitive finite even when a custom caller supplies a
+        // zero or invalid duration; normal Avian schedules already provide a
+        // positive value, so this is only a numerical safety rail.
+        let delta_secs = if delta_secs.is_finite() && delta_secs > 1.0e-6 {
+            delta_secs
+        } else {
+            1.0e-6
+        };
         let mut impulse = if separation > 0.0 {
             // Speculative contact: Push back the part of the velocity that would cause penetration.
             -self.effective_mass * (normal_speed + separation / delta_secs)
@@ -222,7 +234,12 @@ impl ContactNormalPart {
         // Enforce the real normal impulse bound in the velocity solve, not
         // via a fabricated effective mass or post-solver velocity refund.
         impulse = self.clamp_accumulated_impulse(self.impulse + impulse);
-        self.total_impulse += self.impulse;
+        // `total_impulse` is the impulse applied this solve, not the running
+        // accumulated state. Adding `self.impulse` here counted the entire
+        // warm-started impulse once per iteration and inflated fracture work
+        // for resting stacks. Only the newly applied delta belongs in the
+        // per-substep total.
+        self.total_impulse += impulse;
 
         // Return the clamped incremental normal impulse.
         impulse
@@ -292,4 +309,19 @@ mod material_capacity_tests {
         assert_eq!(normal.warm_start_impulse(2.0), 246.0);
         assert!(!normal.capacity_exceeded);
     }
+
+    #[test]
+    fn total_impulse_counts_applied_delta_once_per_iteration() {
+        let mut normal = part(0.0);
+        normal.solve_impulse::<false>(
+            0.0, Vector::splat(-10.0), Vector::X, 0.0, 1.0 / 60.0,
+        );
+        let first = normal.total_impulse;
+        normal.solve_impulse::<false>(
+            0.0, Vector::ZERO, Vector::X, 0.0, 1.0 / 60.0,
+        );
+        assert!(first > 0.0);
+        assert_eq!(normal.total_impulse, first);
+    }
 }
+
