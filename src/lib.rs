@@ -21,11 +21,11 @@
 //! ```toml
 //! # For 2D applications:
 //! [dependencies]
-//! avian2d = "0.7"
+//! avian2d = "0.8"
 //!
 //! # For 3D applications:
 //! [dependencies]
-//! avian3d = "0.7"
+//! avian3d = "0.8"
 //!
 //! # If you want to use the most up-to-date version, you can follow the main branch:
 //! [dependencies]
@@ -39,7 +39,7 @@
 //! [dependencies]
 //! # Add 3D Avian with double-precision floating point numbers.
 //! # `parry-f64` enables collision detection using Parry.
-//! avian3d = { version = "0.7", default-features = false, features = ["3d", "f64", "parry-f64", "xpbd_joints"] }
+//! avian3d = { version = "0.8", default-features = false, features = ["3d", "f64", "parry-f64", "xpbd_joints"] }
 //! ```
 //!
 //! ## Feature Flags
@@ -66,7 +66,6 @@
 //! | `debug-plugin`         | Enables physics debug rendering using the [`PhysicsDebugPlugin`]. The plugin must be added separately.                                              | Yes             |
 //! | `enhanced-determinism` | Enables cross-platform deterministic math, improving determinism across architectures at a small performance cost.                                  | No              |
 //! | `parallel`             | Enables some extra multithreading, which improves performance for larger simulations but can add some overhead for smaller ones.                    | Yes             |
-//! | `simd`                 | Enables [SIMD] optimizations.                                                                                                                       | No              |
 //! | `serialize`            | Enables support for serialization and deserialization using Serde.                                                                                  | No              |
 //! | `validate`             | Enables additional correctness checks and validation at the cost of worse performance.                                                              | No              |
 //!

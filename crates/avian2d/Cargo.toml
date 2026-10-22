@@ -1,6 +1,6 @@
 [package]
 name = "avian2d"
-version = "0.8.0-dev"
+version = "0.8.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["Joona Aalto <jondolf.dev@gmail.com>"]
@@ -64,6 +64,9 @@ diagnostic_ui = ["bevy_diagnostic", "bevy/bevy_ui"]
 # Enables additional correctness checks and validation at the cost of worse performance.
 validate = []
 
+# Exposes internal testing utilities. Only intended for use by benchmarks.
+test = []
+
 [lib]
 name = "avian2d"
 path = "../../src/lib.rs"
@@ -86,7 +89,7 @@ libm = { version = "0.2", optional = true }
 approx = "0.5"
 parry2d = { version = "0.31", optional = true }
 parry2d-f64 = { version = "0.31", optional = true }
-obvhs = { version = "0.3" }
+obvhs = { version = "0.4" }
 serde = { version = "1", features = ["derive"], optional = true }
 derive_more = "2"
 thiserror = "2"
