@@ -736,7 +736,9 @@ fn solve_continuous(
 
             let shape1 = collider1.shape_scaled().as_ref();
 
-            // No swept CCD for trimeshes, heightfields, polylines, or voxels.
+            // Parry provides voxel shape casts, including against voxel
+            // obstacles. Unsupported triangle/mesh-like shapes still skip
+            // sweeps; their geometry must never be replaced by a fake hull.
             if !crate::collision::collider::shape_supports_sweeps(shape1) {
                 continue;
             }
@@ -1198,4 +1200,61 @@ fn compute_ccd_toi(
 
     let toi = hit.time_of_impact.f32();
     (toi > 0.0 && toi < min_toi).then_some(toi)
+}
+
+#[cfg(all(test, feature = "3d", feature = "parry-f32"))]
+mod voxel_swept_ccd_tests {
+    use super::*;
+
+    /// A real 10 cm voxel collider has a finite CCD thickness. A previous
+    /// shape filter turned it into infinity and caused the fast-body check to
+    /// skip swept CCD before any time-of-impact query could run.
+    #[test]
+    fn voxel_collider_enters_swept_ccd_with_real_thickness() {
+        let collider = Collider::voxels(Vec3::splat(0.1), &[IVec3::ZERO]);
+        let shape = collider.shape_scaled();
+        assert!(crate::collision::collider::shape_supports_sweeps(shape.as_ref()));
+        let thickness = shape.ccd_thickness();
+        assert!((thickness - 0.1).abs() < 1.0e-5);
+        assert!(0.333 > SweptCcd::default().threshold * thickness);
+    }
+
+    /// Twenty metres per second traverses 33 cm in a 60 Hz tick. The exact
+    /// voxel-to-voxel cast must stop at a 10 cm pane, not tunnel to the other
+    /// side. The same motion alongside the pane must not create a ghost hit.
+    #[test]
+    fn fast_voxel_has_exact_toi_at_thin_voxel_wall_without_ghost_hit() {
+        let moving = Collider::voxels(Vec3::splat(0.1), &[IVec3::ZERO]);
+        let pane = Collider::voxels(Vec3::splat(0.1), &[IVec3::ZERO]);
+        let moving_shape = moving.shape_scaled();
+        let pane_shape = pane.shape_scaled();
+        let stationary = parry::math::Pose::identity();
+        let velocity = parry::math::Vector::new(0.0, 0.0, 20.0);
+        let duration = 1.0 / 60.0;
+        let options = ShapeCastOptions {
+            max_time_of_impact: duration,
+            stop_at_penetration: false,
+            ..default()
+        };
+
+        // The leading face at z=-0.25 reaches the pane at z=0 after
+        // 0.25 / 20 seconds, strictly before the next discrete step.
+        let on_axis = parry::math::Pose::translation(0.0, 0.0, -0.35);
+        let hit = cast_shapes(
+            &on_axis, velocity, moving_shape.as_ref(),
+            &stationary, parry::math::Vector::ZERO, pane_shape.as_ref(),
+            options,
+        ).expect("voxel shape casting is supported")
+            .expect("fast voxel must hit thin voxel pane");
+        assert!((hit.time_of_impact - 0.0125).abs() < 1.0e-3);
+
+        // A full metre to the side: swept CCD must respect the real
+        // occupied cells rather than a guessed contact plane.
+        let off_axis = parry::math::Pose::translation(1.0, 0.0, -0.35);
+        assert!(cast_shapes(
+            &off_axis, velocity, moving_shape.as_ref(),
+            &stationary, parry::math::Vector::ZERO, pane_shape.as_ref(),
+            options,
+        ).expect("voxel shape casting is supported").is_none());
+    }
 }

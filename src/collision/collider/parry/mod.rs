@@ -28,14 +28,18 @@ impl<T: IntoCollider<Collider>> From<T> for Collider {
     }
 }
 
-/// Returns `true` if the given shape supports CCD sweeps.
+/// Returns `true` for shapes with Parry-supported time-of-impact casts.
+///
+/// Parry 0.31 implements linear and nonlinear voxel shape casts and gives
+/// Voxels a finite CCD thickness based on its actual voxel size. Excluding
+/// them here prevented fast voxel bodies from *ever* entering swept CCD,
+/// even though the underlying collision backend supports their geometry.
 pub(crate) fn shape_supports_sweeps(shape: &dyn parry::shape::Shape) -> bool {
     !matches!(
         shape.as_typed_shape(),
         TypedShape::TriMesh(_)
             | TypedShape::Polyline(_)
             | TypedShape::HeightField(_)
-            | TypedShape::Voxels(_)
             | TypedShape::Segment(_)
             | TypedShape::Triangle(_)
     )
