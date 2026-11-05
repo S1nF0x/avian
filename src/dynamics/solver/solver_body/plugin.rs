@@ -14,7 +14,7 @@ use crate::{
     math::ToRealPrecision,
     prelude::{
         AppDiagnosticsExt, ComputedAngularInertia, ComputedCenterOfMass, ComputedMass, Dominance,
-        LockedAxes,
+        LockedAxes, MassPropertyHelper,
     },
     utils::{MIN_PAR_ITER_ENTITIES, ParallelQueryForEach},
 };
@@ -326,6 +326,18 @@ fn prepare_solver_bodies(
             }
         },
     );
+}
+
+/// Recomputes mass properties for bodies spawned after the main physics prepare
+/// stage. The rigid-body observer runs before the separately inserted
+/// MassPropertiesBundle, so its initial computed values may be stale.
+pub(crate) fn update_new_solver_body_mass_properties(
+    query: Query<Entity, Added<SolverBodyIndex>>,
+    mut mass_helper: MassPropertyHelper,
+) {
+    for entity in &query {
+        mass_helper.update_mass_properties(entity);
+    }
 }
 
 /// Initializes solver state for dynamic bodies created during a contact-breakage
