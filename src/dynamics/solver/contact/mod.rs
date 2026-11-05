@@ -15,7 +15,9 @@ use crate::{
 use bevy::reflect::{ReflectDeserialize, ReflectSerialize};
 use bevy::{reflect::Reflect, utils::default};
 
-use super::solver_body::{SolverBody, SolverBodyIndex, SolverBodyInertia};
+use super::solver_body::{
+    SolverBodiesAccess, SolverBody, SolverBodyIndex, SolverBodyInertia,
+};
 use tangent_part::TangentImpulse;
 
 /// Clamp the *applied* cached friction to the Coulomb limit of a capped
@@ -72,6 +74,13 @@ pub struct ContactConstraintPoint {
     ///
     /// A negative separation indicates penetration.
     pub initial_separation: f32,
+
+    /// Net impulse applied to this point during the current substep.
+    /// Includes warm starting and every subsequent solver correction.
+    pub(crate) substep_applied_normal_impulse: f32,
+
+    /// Net friction impulse applied to this point during the current substep.
+    pub(crate) substep_applied_tangent_impulse: TangentImpulse,
 }
 
 /// A contact constraint used for resolving inter-penetration between two bodies.
@@ -213,6 +222,8 @@ impl ContactConstraint {
                 anchor2,
                 normal_speed: point.normal_speed,
                 initial_separation: -point.penetration - (anchor2 - anchor1).dot(manifold.normal),
+                substep_applied_normal_impulse: 0.0,
+                substep_applied_tangent_impulse: default(),
             };
 
             point
@@ -243,7 +254,7 @@ impl ContactConstraint {
 
     /// Warm starts the contact constraint by applying the impulses from the previous frame or substep.
     pub fn warm_start(
-        &self,
+        &mut self,
         body1: &mut SolverBody,
         body2: &mut SolverBody,
         inertia1: &SolverBodyInertia,
@@ -257,7 +268,13 @@ impl ContactConstraint {
 
         let tangent_directions = self.tangent_directions();
 
-        for point in self.points.iter() {
+        for point in self.points.iter_mut() {
+            // The ledger is local to this substep. It records the complete
+            // impulse applied to the bodies, not only the solver's accumulated
+            // lambda delta, so a topology edit can reverse a stale contact.
+            point.substep_applied_normal_impulse = 0.0;
+            point.substep_applied_tangent_impulse = default();
+
             // Fixed anchors
             let r1 = point.anchor1;
             let r2 = point.anchor2;
@@ -272,6 +289,8 @@ impl ContactConstraint {
                 normal_impulse,
                 point.normal_part.max_impulse.is_finite(),
             );
+            point.substep_applied_normal_impulse += normal_impulse;
+            point.substep_applied_tangent_impulse += tangent_impulse;
 
             #[cfg(feature = "2d")]
             let p = normal_impulse * self.normal
@@ -286,6 +305,69 @@ impl ContactConstraint {
 
             body2.linear_velocity += p * inv_mass2;
             body2.angular_velocity += inv_angular_inertia2 * cross(r2, p);
+        }
+    }
+
+    /// Reverses this contact's net impulse from the current substep.
+    ///
+    /// This is required when a fracture replaces the geometry that produced
+    /// the contact. The replacement contact is then rebuilt and solved against
+    /// the new finite-mass fragments instead of retaining an impulse from the
+    /// retired static collider.
+    pub(crate) fn rollback_substep_impulses(&mut self, access: &SolverBodiesAccess) {
+        let mut dummy_body1 = SolverBody::DUMMY;
+        let mut dummy_body2 = SolverBody::DUMMY;
+        let (mut body1, mut inertia1) = (&mut dummy_body1, &SolverBodyInertia::DUMMY);
+        let (mut body2, mut inertia2) = (&mut dummy_body2, &SolverBodyInertia::DUMMY);
+
+        // SAFETY: This method is called sequentially while the constraint graph
+        // is being rebuilt. No other solver access is active at this barrier.
+        let (b1, b2) =
+            unsafe { access.get_pair_unchecked_mut(self.body_index1, self.body_index2) };
+        if let Some((body, inertia)) = b1 {
+            body1 = body;
+            inertia1 = inertia;
+        }
+        if let Some((body, inertia)) = b2 {
+            body2 = body;
+            inertia2 = inertia;
+        }
+
+        match self.relative_dominance.cmp(&0) {
+            Ordering::Greater => inertia1 = &SolverBodyInertia::DUMMY,
+            Ordering::Less => inertia2 = &SolverBodyInertia::DUMMY,
+            Ordering::Equal => {}
+        }
+
+        let inv_mass1 = inertia1.effective_inv_mass();
+        let inv_mass2 = inertia2.effective_inv_mass();
+        let inv_angular_inertia1 = inertia1.effective_inv_angular_inertia();
+        let inv_angular_inertia2 = inertia2.effective_inv_angular_inertia();
+        let tangent_directions = self.tangent_directions();
+
+        for point in &mut self.points {
+            let normal_impulse = point.substep_applied_normal_impulse;
+            let tangent_impulse = point.substep_applied_tangent_impulse;
+            #[cfg(feature = "2d")]
+            let impulse = normal_impulse * self.normal
+                + tangent_impulse * tangent_directions[0];
+            #[cfg(feature = "3d")]
+            let impulse = normal_impulse * self.normal
+                + tangent_impulse.x * tangent_directions[0]
+                + tangent_impulse.y * tangent_directions[1];
+
+            let r1 = point.anchor1;
+            let r2 = point.anchor2;
+
+            // Reverse the exact net impulse previously applied by this
+            // contact. Other contacts in the same island remain untouched.
+            body1.linear_velocity += impulse * inv_mass1;
+            body1.angular_velocity += inv_angular_inertia1 * cross(r1, impulse);
+            body2.linear_velocity -= impulse * inv_mass2;
+            body2.angular_velocity -= inv_angular_inertia2 * cross(r2, impulse);
+
+            point.substep_applied_normal_impulse = 0.0;
+            point.substep_applied_tangent_impulse = default();
         }
     }
 
@@ -332,6 +414,7 @@ impl ContactConstraint {
             );
 
             let impulse = impulse_magnitude * self.normal;
+            point.substep_applied_normal_impulse += impulse_magnitude;
 
             // Apply the impulse.
             body1.linear_velocity -= impulse * inv_mass1;
@@ -369,6 +452,8 @@ impl ContactConstraint {
                     self.friction,
                     point.normal_part.impulse,
                 );
+
+                point.substep_applied_tangent_impulse += impulse;
 
                 // Apply the impulse.
                 body1.linear_velocity -= impulse * inv_mass1;
@@ -423,6 +508,7 @@ impl ContactConstraint {
 
             // Add the incremental impulse instead of the full impulse because this is not a substep.
             point.normal_part.total_impulse += impulse;
+            point.substep_applied_normal_impulse += impulse;
 
             // Apply the impulse.
             let impulse = impulse * self.normal;
