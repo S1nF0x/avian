@@ -334,7 +334,7 @@ impl ContactConstraint {
     /// a fracture replaces the geometry that produced the contact, so the
     /// replacement contact is solved against the new finite-mass fragments
     /// instead of retaining impulses absorbed by the retired static collider.
-    pub(crate) fn rollback_substep_impulses(&mut self, access: &SolverBodiesAccess) {
+    pub(crate) fn rollback_step_impulses(&mut self, access: &SolverBodiesAccess) {
         let mut dummy_body1 = SolverBody::DUMMY;
         let mut dummy_body2 = SolverBody::DUMMY;
         let (mut body1, mut inertia1) = (&mut dummy_body1, &SolverBodyInertia::DUMMY);
