@@ -34,35 +34,41 @@ The application, not Avian, owns voxel material and collider-swap proofs.
 
 ## Guarantees and boundaries
 
-This barrier enforces ordering and conservative fallback for contact
-constraint *rebuilding*; it does **not** create fictional mass or return an
-unspent solver impulse to a body. A previous normal impulse ceiling may
-already have influenced solver velocities before the barrier runs.
-The post-cut manifold is re-solved against the verified collider, or a
-rejected proposal is re-solved against the original manifold, but neither
-is a bit-for-bit replay of all contacts, joints, and integrated positions.
+The substep pipeline now performs these operations in order:
 
-**Strict physical atomicity (all-or-nothing impulse rollback) is not
-claimed.** Achieving that requires a staged solver-body/contact-island
-snapshot before provisional contact warm start, plus deterministic rollback
-and island replay after voxel/collider publication (including CCD,
-restitution, joint constraints, and neighboring manifolds). No such
-arbitrary mid-substep snapshot has been added in this commit.
+1. The owner publishes the exact material-volume and collider replacement.
+2. Avian refreshes changed collider AABBs, collects BVH pairs for newly
+   published bodies, and updates the narrow-phase manifolds.
+3. Before contact-status changes prune old constraints, Avian refreshes
+   solver-body indices by stable entity identity and reverses the net impulse
+   applied by every replaced contact since that constraint graph was built.
+4. The owner transfers a dynamic source's post-rollback rigid velocity field
+   to its surviving and detached components.
+5. Avian recomputes changed mass properties, initializes new solver bodies,
+   rebuilds only requested constraints, and solves only those constraints.
+6. Velocity damping runs, then the current substep's position integration runs.
 
-Owner responsibilities:
-- Reserve a bounded edit/publication slot *before* source topology commit.
-- Apply the same exact material ledger to source topology and resident volume.
-- Flush ECS collider publication before narrow-phase refresh and ticket ack.
-- Reject tickets if any affected collider remains stale. A partial
-  multi-brick cut must not masquerade as a fully published opening.
-- Preserve deferred transactions with original source revision and reject
-  material mismatches rather than rebasing stale plans.
-- Observe finite `SolverConfig::contact_re_solve_max_passes` and count
-  `contact_re_solve_dropped`.
+New fragments can therefore create ordinary contact constraints with the
+impactor and neighboring bodies in the same substep. Unchanged constraints
+retain their already-solved state and are not solved a second time.
 
-Regression coverage in `plugin.rs` verifies: no early re-solve from staging,
-implicit timeout fallback, duplicate and rejected acknowledgments, bounded
-passes, and stale generation rejection.
+This is a local contact transaction, not a bit-for-bit replay of the entire
+fixed step or contact island. Positions committed by earlier substeps remain
+committed; joints, CCD, and end-of-step restitution are not rolled back and
+replayed as part of the fracture transaction. The current substep's position
+integration is deliberately deferred until after the replacement contacts
+have been solved. Cross-platform deterministic replay is not claimed.
+
+Owner responsibilities remain unchanged:
+- Validate the source revision and exact material ledger before committing topology.
+- Flush the collider replacement before acknowledging the publication ticket.
+- Reject or defer incomplete collider publication.
+- Keep contact re-solve work within the configured per-substep pass and ID limits.
+
+The solver queue tests verify that rollback and re-solve use the identical
+sorted contact set, including the full-graph fallback. They also retain
+coverage for unconfirmed, rejected, duplicate, stale-generation, and bounded
+requests.
 
 ## Verification
 
