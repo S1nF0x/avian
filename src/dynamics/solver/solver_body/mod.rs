@@ -12,6 +12,7 @@
 mod plugin;
 
 pub use plugin::SolverBodyPlugin;
+pub(crate) use plugin::prepare_new_solver_bodies;
 
 use core::marker::PhantomData;
 
