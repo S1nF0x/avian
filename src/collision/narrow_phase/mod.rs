@@ -25,7 +25,13 @@ pub use system_param::{ContactStatusChange, ContactStatusChangeQueue, NarrowPhas
 
 use core::marker::PhantomData;
 
-use crate::{dynamics::joints::joint_graph::JointGraph, prelude::*};
+use crate::{
+    dynamics::{
+        joints::joint_graph::JointGraph,
+        solver::{ContactReseolveQueue, schedule::{ContactBreakageSystems, SubstepSchedule}},
+    },
+    prelude::*,
+};
 use bevy::{
     ecs::{
         entity_disabling::Disabled,
@@ -122,6 +128,13 @@ where
                 .in_set(NarrowPhaseSystems::Update)
                 // Allowing ambiguities is required so that it's possible
                 // to have multiple collision backends at the same time.
+                .ambiguous_with_all(),
+        );
+        app.add_systems(
+            SubstepSchedule,
+            update_narrow_phase::<C, H>
+                .in_set(ContactBreakageSystems::RefreshNarrowPhase)
+                .run_if(|queue: Res<ContactReseolveQueue>| queue.has_pending_rebuild())
                 .ambiguous_with_all(),
         );
 

@@ -7,7 +7,10 @@ use crate::{
     },
     collision::{CollisionDiagnostics, contact_types::ContactEdgeFlags},
     data_structures::pair_key::PairKey,
-    dynamics::joints::joint_graph::JointGraph,
+    dynamics::{
+        joints::joint_graph::JointGraph,
+        solver::{ContactReseolveQueue, schedule::{ContactBreakageSystems, SubstepSchedule}},
+    },
     prelude::*,
 };
 use bevy::{
@@ -44,6 +47,12 @@ where
         app.add_systems(
             PhysicsSchedule,
             collect_collision_pairs::<H>.in_set(BroadPhaseSystems::CollectCollisions),
+        );
+        app.add_systems(
+            SubstepSchedule,
+            collect_collision_pairs::<H>
+                .in_set(ContactBreakageSystems::RefreshBroadPhase)
+                .run_if(|queue: Res<ContactReseolveQueue>| queue.has_pending_rebuild()),
         );
     }
 }

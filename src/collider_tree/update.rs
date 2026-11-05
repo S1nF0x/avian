@@ -8,6 +8,7 @@ use crate::{
         tree::ColliderTreeProxyFlags,
     },
     collision::collider::{ColliderAabbMargin, EnlargedAabb},
+    dynamics::solver::{ContactReseolveQueue, schedule::{ContactBreakageSystems, SubstepSchedule}},
     data_structures::bit_vec::BitVec,
     dynamics::solver::solver_body::SolverBodyIndex,
     prelude::*,
@@ -53,6 +54,13 @@ impl<C: AnyCollider> Plugin for ColliderTreeUpdatePlugin<C> {
                 .in_set(ColliderTreeSystems::UpdateAabbs)
                 // Allowing ambiguities is required so that it's possible
                 // to have multiple collision backends at the same time.
+                .ambiguous_with_all(),
+        );
+        app.add_systems(
+            SubstepSchedule,
+            update_moved_collider_aabbs::<C>
+                .in_set(ContactBreakageSystems::RefreshAabbs)
+                .run_if(|queue: Res<ContactReseolveQueue>| queue.has_pending_rebuild())
                 .ambiguous_with_all(),
         );
 

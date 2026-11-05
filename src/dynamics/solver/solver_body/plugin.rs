@@ -328,11 +328,23 @@ fn prepare_solver_bodies(
     );
 }
 
-/// Recomputes mass properties for bodies spawned after the main physics prepare
-/// stage. The rigid-body observer runs before the separately inserted
-/// MassPropertiesBundle, so its initial computed values may be stale.
+/// Recomputes mass properties for solver bodies whose index, explicit mass data,
+/// or collider-derived mass data changed after the main physics prepare stage.
 pub(crate) fn update_new_solver_body_mass_properties(
-    query: Query<Entity, Changed<SolverBodyIndex>>,
+    query: Query<
+        Entity,
+        (
+            With<SolverBodyIndex>,
+            Or<(
+                Changed<SolverBodyIndex>,
+                Changed<Mass>,
+                Changed<AngularInertia>,
+                Changed<CenterOfMass>,
+                Changed<ColliderMassProperties>,
+                Changed<ColliderTransform>,
+            )>,
+        ),
+    >,
     mut mass_helper: MassPropertyHelper,
 ) {
     for entity in &query {
@@ -340,40 +352,47 @@ pub(crate) fn update_new_solver_body_mass_properties(
     }
 }
 
-/// Initializes solver state for dynamic bodies created during a contact-breakage
-/// substep. Their SolverBodyIndex is inserted by the rigid-body observer, but
-/// the normal PhysicsSchedule preparation pass has already run. Without this
-/// synchronization, a fresh fragment has zero inverse mass during the
-/// same-substep contact rebuild and behaves like a static body.
+/// Synchronizes solver state for bodies created or whose mass properties changed
+/// during a contact-breakage substep. New bodies need full initialization; retained
+/// bodies preserve their accumulated substep deltas while receiving updated
+/// velocities and inertial properties.
 pub(crate) fn prepare_new_solver_bodies(
     mut solver_bodies: ResMut<SolverBodies>,
     query: Query<(
         &RigidBody,
         &SolverBodyIndex,
-        &LinearVelocity,
-        &AngularVelocity,
+        Ref<LinearVelocity>,
+        Ref<AngularVelocity>,
         &Rotation,
         &ComputedMass,
         &ComputedAngularInertia,
         Option<&LockedAxes>,
         Option<&Dominance>,
         Has<CustomPositionIntegration>,
-    ), Changed<SolverBodyIndex>>,
+    ), Or<(
+        Changed<SolverBodyIndex>,
+        Changed<ComputedMass>,
+        Changed<ComputedAngularInertia>,
+        Changed<ComputedCenterOfMass>,
+        Changed<LinearVelocity>,
+        Changed<AngularVelocity>,
+    )>>,
 ) {
     let access = solver_bodies.access();
 
     for (rb, index, linear_velocity, angular_velocity, rotation, mass, angular_inertia, locked_axes, dominance, custom_position_integration) in &query {
         // SAFETY: Each newly added solver-body index is unique and this loop is sequential.
         let solver_body = unsafe { access.body_unchecked_mut(*index) };
-        if !solver_body.flags.contains(SolverBodyFlags::NEEDS_INITIALIZATION) {
-            continue;
+        let needs_initialization = solver_body.flags.contains(SolverBodyFlags::NEEDS_INITIALIZATION);
+        if needs_initialization || linear_velocity.is_changed() || angular_velocity.is_changed() {
+            solver_body.linear_velocity = linear_velocity.0;
+            solver_body.angular_velocity = angular_velocity.0;
+        }
+        if needs_initialization {
+            solver_body.delta_position = Vector::ZERO;
+            solver_body.delta_rotation = Rot::IDENTITY;
         }
         let inertial_properties = unsafe { access.inertia_unchecked_mut(*index) };
-
-        solver_body.linear_velocity = linear_velocity.0;
-        solver_body.angular_velocity = angular_velocity.0;
-        solver_body.delta_position = Vector::ZERO;
-        solver_body.delta_rotation = Rot::IDENTITY;
 
         let locked_axes = locked_axes.copied().unwrap_or_default();
         *inertial_properties = SolverBodyInertia::new(
@@ -386,17 +405,18 @@ pub(crate) fn prepare_new_solver_bodies(
             dominance.map_or(0, |dominance| dominance.0),
             rb.is_dynamic(),
         );
-        solver_body.flags = SolverBodyFlags(locked_axes.to_bits() as u32);
-        solver_body.flags.set(SolverBodyFlags::IS_KINEMATIC, rb.is_kinematic());
-        solver_body.flags.set(SolverBodyFlags::CUSTOM_POSITION_INTEGRATION, custom_position_integration);
+        let mut flags = SolverBodyFlags(locked_axes.to_bits() as u32);
+        flags.set(SolverBodyFlags::IS_KINEMATIC, rb.is_kinematic());
+        flags.set(SolverBodyFlags::CUSTOM_POSITION_INTEGRATION, custom_position_integration);
 
         #[cfg(feature = "3d")]
         {
             let epsilon = 1e-6;
             let is_gyroscopic = !locked_axes.is_rotation_locked()
                 && !angular_inertia.inverse().is_isotropic(epsilon);
-            solver_body.flags.set(SolverBodyFlags::GYROSCOPIC_MOTION, is_gyroscopic);
+            flags.set(SolverBodyFlags::GYROSCOPIC_MOTION, is_gyroscopic);
         }
+        solver_body.flags = flags;
     }
 }
 /// Writes back solver body data to rigid bodies.

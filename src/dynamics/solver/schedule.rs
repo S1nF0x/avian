@@ -62,14 +62,22 @@ impl Plugin for SolverSchedulePlugin {
                         IntegrationSystems::Velocity,
                         SubstepSolverSystems::WarmStart,
                         SubstepSolverSystems::SolveConstraints,
-                        IntegrationSystems::Position,
                         SubstepSolverSystems::Relax,
                         ContactBreakageSystems::Detect,
                         ContactBreakageSystems::Apply,
+                        ContactBreakageSystems::RefreshAabbs,
+                        ContactBreakageSystems::RefreshBroadPhase,
+                        ContactBreakageSystems::RefreshNarrowPhase,
+                        ContactBreakageSystems::RefreshContacts,
+                        ContactBreakageSystems::Rollback,
                         ContactBreakageSystems::Rebuild,
+                        ContactBreakageSystems::PrepareBodies,
+                        ContactBreakageSystems::PrepareSolverBodies,
+                        ContactBreakageSystems::RebuildConstraints,
                         ContactBreakageSystems::PrepareReSolve,
                         ContactBreakageSystems::ReSolve,
                         SubstepSolverSystems::Damping,
+                        IntegrationSystems::Position,
                     )
                         .chain(),
                 );
@@ -136,14 +144,14 @@ pub type SolverSet = SolverSystems;
 /// 1. Integrate velocity ([`IntegrationSystems::Velocity`])
 /// 2. Warm start ([`SubstepSolverSystems::WarmStart`])
 /// 3. Solve constraints with bias ([`SubstepSolverSystems::SolveConstraints`])
-/// 4. Integrate positions ([`IntegrationSystems::Position`])
-/// 5. Solve constraints without bias to relax velocities ([`SubstepSolverSystems::Relax`])
-/// 6. Detect and apply material breakage ([`ContactBreakageSystems::Detect`] and
+/// 4. Solve constraints without bias to relax velocities ([`SubstepSolverSystems::Relax`])
+/// 5. Detect and publish material topology changes ([`ContactBreakageSystems::Detect`] and
 ///    [`ContactBreakageSystems::Apply`])
-/// 7. Rebuild affected contacts, configure their new constraints, and re-solve
-///    ([`ContactBreakageSystems::Rebuild`], [`ContactBreakageSystems::PrepareReSolve`],
-///    and [`ContactBreakageSystems::ReSolve`])
+/// 6. Refresh collider AABBs, broad-phase pairs, and narrow-phase manifolds for the published geometry
+/// 7. Roll back replaced-contact impulses, update solver bodies, rebuild affected constraints,
+///    and perform a bounded local re-solve
 /// 8. Apply velocity-based constraint damping ([`SubstepSolverSystems::Damping`])
+/// 9. Integrate positions ([`IntegrationSystems::Position`])
 #[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SubstepSolverSystems {
     /// Warm starts the solver by applying the impulses from the previous frame or substep.
@@ -165,20 +173,37 @@ pub enum SubstepSolverSystems {
 /// Extension points for material breakage and same-substep contact rebuilding.
 ///
 /// The [`Detect`](Self::Detect) set emits [`ContactBreakEvent`] messages after
-/// the normal relaxation pass. Applications can update their voxel/material
-/// representation, refresh the affected narrow-phase pairs, and acknowledge
-/// publication from the [`Apply`](Self::Apply) set. Avian rebuilds the affected
-/// constraints in [`Rebuild`](Self::Rebuild), gives applications a
-/// [`PrepareReSolve`](Self::PrepareReSolve) hook to configure those new
-/// constraints, then performs a bounded re-solve in [`ReSolve`](Self::ReSolve).
+/// the normal relaxation pass. Applications publish authoritative material and
+/// collider changes in [`Apply`](Self::Apply). Avian then refreshes changed collider
+/// AABBs, broad-phase pairs, and narrow-phase manifolds before rolling back impulses
+/// from replaced contacts. [`PrepareBodies`](Self::PrepareBodies) lets the owner
+/// transfer post-rollback rigid velocity to its new fragments. Avian updates solver
+/// bodies, rebuilds only requested constraints, and exposes [`PrepareReSolve`](Self::PrepareReSolve)
+/// before the bounded [`ReSolve`](Self::ReSolve).
 #[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ContactBreakageSystems {
     /// Emits contact capacity failures detected by the solver.
     Detect,
     /// Applies user-owned material or topology changes.
     Apply,
-    /// Applies contact status changes and rebuilds the requested constraints.
+    /// Updates collider AABBs after a same-substep topology publication.
+    RefreshAabbs,
+    /// Collects BVH pairs for newly published or moved colliders.
+    RefreshBroadPhase,
+    /// Computes manifolds for the refreshed broad-phase pairs.
+    RefreshNarrowPhase,
+    /// Lets the material owner request contacts involving newly published bodies.
+    RefreshContacts,
+    /// Reverses the net impulse applied by contact constraints whose geometry changed.
+    Rollback,
+    /// Applies queued contact status changes and retires old constraints.
     Rebuild,
+    /// Extension point for transferring source-body motion to newly created fragments.
+    PrepareBodies,
+    /// Updates mass properties and initializes newly created solver bodies.
+    PrepareSolverBodies,
+    /// Rebuilds only the requested contact constraints.
+    RebuildConstraints,
     /// Extension point for configuring newly rebuilt constraints before they solve.
     PrepareReSolve,
     /// Performs the bounded re-solve using the refreshed and configured constraints.

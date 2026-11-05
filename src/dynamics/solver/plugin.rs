@@ -68,8 +68,10 @@ use core::cmp::Ordering;
 ///     1. [Integrate velocities](crate::dynamics::integrator::IntegrationSystems::Velocity)
 ///     2. [Warm start](SubstepSolverSystems::WarmStart)
 ///     3. [Solve constraints with bias](SubstepSolverSystems::SolveConstraints)
-///     4. [Integrate positions](crate::dynamics::integrator::IntegrationSystems::Position)
-///     5. [Solve constraints without bias to relax velocities](SubstepSolverSystems::Relax)
+///     4. [Solve constraints without bias to relax velocities](SubstepSolverSystems::Relax)
+///     5. Detect material failure, publish topology, refresh new contacts, roll back replaced
+///        contact impulses, and perform a bounded local re-solve.
+///     6. Apply velocity-based constraint damping and integrate positions.
 /// 5. [Apply restitution](SolverSystems::Restitution)
 /// 6. [Write back solver body data to rigid bodies](SolverSystems::Finalize)
 /// 7. [Store contact impulses for next frame's warm starting](SolverSystems::StoreContactImpulses)
@@ -185,14 +187,19 @@ impl Plugin for SolverPlugin {
             emit_contact_break_events.in_set(ContactBreakageSystems::Detect),
         );
         substeps.add_systems(
-            (
-                apply_contact_status_changes,
-                update_new_solver_body_mass_properties,
-                prepare_new_solver_bodies,
-                rebuild_requested_contact_constraints,
-            )
+            rollback_requested_contact_impulses.in_set(ContactBreakageSystems::Rollback),
+        );
+        substeps.add_systems(
+            apply_contact_status_changes.in_set(ContactBreakageSystems::Rebuild),
+        );
+        substeps.add_systems(
+            (update_new_solver_body_mass_properties, prepare_new_solver_bodies)
                 .chain()
-                .in_set(ContactBreakageSystems::Rebuild),
+                .in_set(ContactBreakageSystems::PrepareSolverBodies),
+        );
+        substeps.add_systems(
+            rebuild_requested_contact_constraints
+                .in_set(ContactBreakageSystems::RebuildConstraints),
         );
         substeps.add_systems(
             re_solve_requested_contacts.in_set(ContactBreakageSystems::ReSolve),
@@ -681,7 +688,7 @@ pub struct ContactReseolveQueue {
     pending: Vec<ContactId>,
     pending_all: bool,
     passes_this_substep: u8,
-    prepared: bool,
+    prepared_contacts: Option<Option<Vec<ContactId>>>,
     dropped_this_substep: bool,
     /// A fracture is provisional until the owner has applied its exact
     /// volume edit AND published the corresponding collider. Unknown or
@@ -818,7 +825,29 @@ impl ContactReseolveQueue {
     /// for an application preparation hook before the bounded re-solve.
     #[inline]
     pub fn has_prepared_re_solve(&self) -> bool {
-        self.prepared
+        self.prepared_contacts.is_some()
+    }
+
+    /// Returns whether a same-substep topology refresh or contact re-solve is pending.
+    pub(crate) fn has_pending_rebuild(&self) -> bool {
+        self.pending_all || !self.pending.is_empty() || !self.staged_fractures.is_empty()
+    }
+
+    /// Seals fracture tickets and returns the contact IDs whose already-applied impulses
+    /// must be reversed before contact-status changes can prune their constraints.
+    ///
+    /// The request is not consumed here; the same IDs are retained for constraint rebuilding
+    /// and the bounded re-solve later in the substep.
+    pub(crate) fn contacts_for_rollback(&mut self) -> Option<Option<Vec<ContactId>>> {
+        self.seal_fracture_barrier();
+        if self.pending_all {
+            Some(None)
+        } else if self.pending.is_empty() {
+            None
+        } else {
+            self.pending.sort_unstable();
+            Some(Some(self.pending.clone()))
+        }
     }
 
     pub(crate) fn begin_substep(&mut self) {
@@ -827,7 +856,7 @@ impl ContactReseolveQueue {
         // interrupted custom schedule cannot reuse their generations.
         self.staged_fractures.clear();
         self.passes_this_substep = 0;
-        self.prepared = false;
+        self.prepared_contacts = None;
         self.dropped_this_substep = false;
         self.unconfirmed_fractures_this_step = 0;
     }
@@ -847,24 +876,25 @@ impl ContactReseolveQueue {
         }
 
         self.passes_this_substep += 1;
-        self.prepared = true;
-        if self.pending_all {
+        let requested_contacts = if self.pending_all {
             self.pending_all = false;
-            Some(None)
+            None
         } else {
             self.pending.sort_unstable();
-            Some(Some(core::mem::take(&mut self.pending)))
-        }
+            Some(core::mem::take(&mut self.pending))
+        };
+        self.prepared_contacts = Some(requested_contacts.clone());
+        Some(requested_contacts)
     }
 
-    fn take_prepared(&mut self) -> bool {
-        core::mem::take(&mut self.prepared)
+    fn take_prepared_contacts(&mut self) -> Option<Option<Vec<ContactId>>> {
+        core::mem::take(&mut self.prepared_contacts)
     }
 
     fn clear_pending(&mut self) {
         self.pending.clear();
         self.pending_all = false;
-        self.prepared = false;
+        self.prepared_contacts = None;
         self.staged_fractures.clear();
     }
 
@@ -1109,6 +1139,43 @@ fn prepare_contact_constraints_internal(
         .sum::<usize>() as u32;
 }
 
+/// Reverses affected contact impulses before contact-status changes can
+/// remove their old constraints. Stable entity identity is used to refresh
+/// solver-body indices because fracture publication may have swap-removed a body.
+fn rollback_requested_contact_impulses(
+    mut solver_bodies: ResMut<SolverBodies>,
+    mut constraint_graph: ResMut<ConstraintGraph>,
+    mut re_solve_queue: ResMut<ContactReseolveQueue>,
+    body_indices: Query<&SolverBodyIndex>,
+) {
+    let Some(requested_contacts) = re_solve_queue.contacts_for_rollback() else {
+        return;
+    };
+
+    let access = solver_bodies.access();
+    for color in &mut constraint_graph.colors {
+        for constraint in &mut color.contact_constraints {
+            let affected = requested_contacts.as_ref().is_none_or(|ids| {
+                ids.binary_search(&constraint.contact_id).is_ok()
+            });
+            if !affected {
+                continue;
+            }
+
+            constraint.body_index1 = constraint
+                .body_entity1
+                .and_then(|entity| body_indices.get(entity).ok().copied())
+                .unwrap_or(SolverBodyIndex::INVALID);
+            constraint.body_index2 = constraint
+                .body_entity2
+                .and_then(|entity| body_indices.get(entity).ok().copied())
+                .unwrap_or(SolverBodyIndex::INVALID);
+
+            constraint.rollback_step_impulses(&access);
+        }
+    }
+}
+
 /// Rebuilds the contact constraints requested by a breakage system. Existing
 /// constraints outside the requested contact set are retained, so the
 /// rebuild is local to the affected contact IDs while the following solve can
@@ -1129,32 +1196,19 @@ fn rebuild_requested_contact_constraints(
     if let Some(request) = request {
         let requested_contacts = request.as_deref();
 
-        // The old contact has already changed solver-body velocities.
-        // Reverse only contacts whose geometry is being replaced; untouched
-        // contacts in the island keep their already-solved state.
-        {
-            let access = solver_bodies.access();
-            for color in &mut constraint_graph.colors {
-                for constraint in &mut color.contact_constraints {
-                    let affected = requested_contacts.map_or(true, |ids| {
-                        ids.binary_search(&constraint.contact_id).is_ok()
-                    });
-                    // Body indices can change when a fractured dynamic
-                    // owner is removed and SolverBodies swap-removes it.
-                    // Refresh every retained constraint by stable entity identity.
-                    constraint.body_index1 = constraint
-                        .body_entity1
-                        .and_then(|entity| bodies.get(entity).ok()?.index.copied())
-                        .unwrap_or(SolverBodyIndex::INVALID);
-                    constraint.body_index2 = constraint
-                        .body_entity2
-                        .and_then(|entity| bodies.get(entity).ok()?.index.copied())
-                        .unwrap_or(SolverBodyIndex::INVALID);
-
-                    if affected {
-                        constraint.rollback_step_impulses(&access);
-                    }
-                }
+        // Solver-body indices are refreshed by entity identity after any
+        // fracture-driven body insertion/removal. Impulse rollback already
+        // happened before contact-status changes could prune the old constraints.
+        for color in &mut constraint_graph.colors {
+            for constraint in &mut color.contact_constraints {
+                constraint.body_index1 = constraint
+                    .body_entity1
+                    .and_then(|entity| bodies.get(entity).ok()?.index.copied())
+                    .unwrap_or(SolverBodyIndex::INVALID);
+                constraint.body_index2 = constraint
+                    .body_entity2
+                    .and_then(|entity| bodies.get(entity).ok()?.index.copied())
+                    .unwrap_or(SolverBodyIndex::INVALID);
             }
         }
 
@@ -1193,9 +1247,15 @@ fn re_solve_requested_contacts(
     mut diagnostics: ResMut<SolverDiagnostics>,
     mut re_solve_queue: ResMut<ContactReseolveQueue>,
 ) {
-    if !re_solve_queue.take_prepared() {
+    let Some(requested_contacts) = re_solve_queue.take_prepared_contacts() else {
         return;
-    }
+    };
+
+    let is_requested = |contact_id: ContactId| {
+        requested_contacts
+            .as_ref()
+            .is_none_or(|ids| ids.binary_search(&contact_id).is_ok())
+    };
 
     let start = crate::utils::Instant::now();
 
@@ -1210,6 +1270,9 @@ fn re_solve_requested_contacts(
         .contact_constraints
         .iter_mut()
     {
+        if !is_requested(constraint.contact_id) {
+            continue;
+        }
         solve_contacts_internal::<true>(
             &access,
             constraint,
@@ -1232,6 +1295,9 @@ fn re_solve_requested_contacts(
         .filter(|color| !color.contact_constraints.is_empty())
     {
         crate::utils::par_for_each(&mut color.contact_constraints, 64, |_i, constraint| {
+            if !is_requested(constraint.contact_id) {
+                return;
+            }
             solve_contacts_internal::<true>(
                 &access,
                 constraint,
