@@ -357,20 +357,12 @@ impl ContactConstraint {
 
     /// Reverses this contact's net impulse from the current substep.
     ///
+    /// Reverses this contact's net impulse from the current substep.
+    ///
     /// Earlier substeps have already integrated their positions and remain
     /// committed. Fracture rollback therefore reverses only the current
     /// substep's impulse ledger, before this substep's position integration.
     pub(crate) fn rollback_substep_impulses(&mut self, access: &SolverBodiesAccess) {
-        self.rollback_impulses(access, true);
-    }
-
-    /// Reverses this contact's net impulse since its constraints were generated.
-    /// This spans all substeps in the current physics step.
-    pub(crate) fn rollback_step_impulses(&mut self, access: &SolverBodiesAccess) {
-        self.rollback_impulses(access, false);
-    }
-
-    fn rollback_impulses(&mut self, access: &SolverBodiesAccess, substep_only: bool) {
         let mut dummy_body1 = SolverBody::DUMMY;
         let mut dummy_body2 = SolverBody::DUMMY;
         let (mut body1, mut inertia1) = (&mut dummy_body1, &SolverBodyInertia::DUMMY);
@@ -402,16 +394,8 @@ impl ContactConstraint {
         let tangent_directions = self.tangent_directions();
 
         for point in &mut self.points {
-            let normal_impulse = if substep_only {
-                point.substep_applied_normal_impulse
-            } else {
-                point.step_applied_normal_impulse
-            };
-            let tangent_impulse = if substep_only {
-                point.substep_applied_tangent_impulse
-            } else {
-                point.step_applied_tangent_impulse
-            };
+            let normal_impulse = point.substep_applied_normal_impulse;
+            let tangent_impulse = point.substep_applied_tangent_impulse;
             #[cfg(feature = "2d")]
             let impulse = normal_impulse * self.normal
                 + tangent_impulse * tangent_directions[0];
@@ -430,10 +414,6 @@ impl ContactConstraint {
 
             point.substep_applied_normal_impulse = 0.0;
             point.substep_applied_tangent_impulse = default();
-            if !substep_only {
-                point.step_applied_normal_impulse = 0.0;
-                point.step_applied_tangent_impulse = default();
-            }
         }
     }
 
