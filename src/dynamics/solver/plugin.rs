@@ -1115,7 +1115,7 @@ fn prepare_contact_constraints_internal(
 #[allow(clippy::too_many_arguments)]
 fn rebuild_requested_contact_constraints(
     contact_graph: Res<ContactGraph>,
-    constraint_graph: ResMut<ConstraintGraph>,
+    mut constraint_graph: ResMut<ConstraintGraph>,
     mut diagnostics: ResMut<SolverDiagnostics>,
     bodies: Query<BodyQuery, RigidBodyActiveFilter>,
     mut solver_bodies: ResMut<SolverBodies>,
