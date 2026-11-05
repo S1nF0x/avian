@@ -449,7 +449,6 @@ impl ContactConstraint {
 
             let impulse = impulse_magnitude * self.normal;
             point.substep_applied_normal_impulse += impulse_magnitude;
-            point.step_applied_normal_impulse += impulse_magnitude;
 
             // Apply the impulse.
             body1.linear_velocity -= impulse * inv_mass1;
@@ -497,7 +496,6 @@ impl ContactConstraint {
                 );
 
                 point.substep_applied_tangent_impulse += tangent_impulse;
-                point.step_applied_tangent_impulse += tangent_impulse;
 
                 // Apply the impulse.
                 body1.linear_velocity -= impulse * inv_mass1;
@@ -553,7 +551,6 @@ impl ContactConstraint {
             // Add the incremental impulse instead of the full impulse because this is not a substep.
             point.normal_part.total_impulse += impulse;
             point.substep_applied_normal_impulse += impulse;
-            point.step_applied_normal_impulse += impulse;
 
             // Apply the impulse.
             let impulse = impulse * self.normal;
