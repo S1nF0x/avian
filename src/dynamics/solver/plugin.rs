@@ -1855,6 +1855,39 @@ mod contact_re_solve_tests {
     }
 
     #[test]
+    fn rollback_and_re_solve_share_the_same_sorted_contact_set() {
+        let mut queue = ContactReseolveQueue::default();
+        queue.begin_substep();
+        queue.request_contact(ContactId(9));
+        queue.request_contact(ContactId(2));
+
+        assert_eq!(
+            queue.contacts_for_rollback(),
+            Some(Some(vec![ContactId(2), ContactId(9)])),
+        );
+        assert_eq!(
+            queue.take_for_rebuild(2),
+            Some(Some(vec![ContactId(2), ContactId(9)])),
+        );
+        assert_eq!(
+            queue.take_prepared_contacts(),
+            Some(Some(vec![ContactId(2), ContactId(9)])),
+        );
+        assert!(!queue.has_prepared_re_solve());
+    }
+
+    #[test]
+    fn full_rebuild_rolls_back_and_re_solves_the_whole_contact_graph() {
+        let mut queue = ContactReseolveQueue::default();
+        queue.begin_substep();
+        queue.request_all();
+
+        assert_eq!(queue.contacts_for_rollback(), Some(None));
+        assert_eq!(queue.take_for_rebuild(1), Some(None));
+        assert_eq!(queue.take_prepared_contacts(), Some(None));
+    }
+
+    #[test]
     fn contact_re_solve_requests_are_bounded_per_substep() {
         let mut queue = ContactReseolveQueue::default();
         queue.begin_substep();
