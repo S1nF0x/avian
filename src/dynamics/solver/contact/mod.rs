@@ -81,6 +81,14 @@ pub struct ContactConstraintPoint {
 
     /// Net friction impulse applied to this point during the current substep.
     pub(crate) substep_applied_tangent_impulse: TangentImpulse,
+
+    /// Net normal impulse applied since this contact constraint was generated.
+    /// This spans every substep in the current physics step and is used to
+    /// reverse a retired contact before rebuilding its replacement.
+    pub(crate) step_applied_normal_impulse: f32,
+
+    /// Net friction impulse applied since this contact constraint was generated.
+    pub(crate) step_applied_tangent_impulse: TangentImpulse,
 }
 
 /// A contact constraint used for resolving inter-penetration between two bodies.
@@ -230,6 +238,8 @@ impl ContactConstraint {
                 initial_separation: -point.penetration - (anchor2 - anchor1).dot(manifold.normal),
                 substep_applied_normal_impulse: 0.0,
                 substep_applied_tangent_impulse: default(),
+                step_applied_normal_impulse: 0.0,
+                step_applied_tangent_impulse: default(),
             };
 
             point
@@ -299,6 +309,8 @@ impl ContactConstraint {
             );
             point.substep_applied_normal_impulse += normal_impulse;
             point.substep_applied_tangent_impulse += tangent_impulse;
+            point.step_applied_normal_impulse += normal_impulse;
+            point.step_applied_tangent_impulse += tangent_impulse;
 
             #[cfg(feature = "2d")]
             let p = normal_impulse * self.normal
@@ -316,12 +328,12 @@ impl ContactConstraint {
         }
     }
 
-    /// Reverses this contact's net impulse from the current substep.
+    /// Reverses this contact's net impulse since its constraints were generated.
     ///
-    /// This is required when a fracture replaces the geometry that produced
-    /// the contact. The replacement contact is then rebuilt and solved against
-    /// the new finite-mass fragments instead of retaining an impulse from the
-    /// retired static collider.
+    /// This spans all substeps in the current physics step. It is required when
+    /// a fracture replaces the geometry that produced the contact, so the
+    /// replacement contact is solved against the new finite-mass fragments
+    /// instead of retaining impulses absorbed by the retired static collider.
     pub(crate) fn rollback_substep_impulses(&mut self, access: &SolverBodiesAccess) {
         let mut dummy_body1 = SolverBody::DUMMY;
         let mut dummy_body2 = SolverBody::DUMMY;
@@ -354,8 +366,8 @@ impl ContactConstraint {
         let tangent_directions = self.tangent_directions();
 
         for point in &mut self.points {
-            let normal_impulse = point.substep_applied_normal_impulse;
-            let tangent_impulse = point.substep_applied_tangent_impulse;
+            let normal_impulse = point.step_applied_normal_impulse;
+            let tangent_impulse = point.step_applied_tangent_impulse;
             #[cfg(feature = "2d")]
             let impulse = normal_impulse * self.normal
                 + tangent_impulse * tangent_directions[0];
@@ -376,6 +388,8 @@ impl ContactConstraint {
 
             point.substep_applied_normal_impulse = 0.0;
             point.substep_applied_tangent_impulse = default();
+            point.step_applied_normal_impulse = 0.0;
+            point.step_applied_tangent_impulse = default();
         }
     }
 
@@ -423,6 +437,7 @@ impl ContactConstraint {
 
             let impulse = impulse_magnitude * self.normal;
             point.substep_applied_normal_impulse += impulse_magnitude;
+            point.step_applied_normal_impulse += impulse_magnitude;
 
             // Apply the impulse.
             body1.linear_velocity -= impulse * inv_mass1;
@@ -462,6 +477,7 @@ impl ContactConstraint {
                 );
 
                 point.substep_applied_tangent_impulse += impulse;
+                point.step_applied_tangent_impulse += impulse;
 
                 // Apply the impulse.
                 body1.linear_velocity -= impulse * inv_mass1;
@@ -517,6 +533,7 @@ impl ContactConstraint {
             // Add the incremental impulse instead of the full impulse because this is not a substep.
             point.normal_part.total_impulse += impulse;
             point.substep_applied_normal_impulse += impulse;
+            point.step_applied_normal_impulse += impulse;
 
             // Apply the impulse.
             let impulse = impulse * self.normal;
