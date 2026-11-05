@@ -6,9 +6,9 @@ use bevy::reflect::{ReflectDeserialize, ReflectSerialize};
 use bevy_math::Vec2;
 
 #[cfg(feature = "2d")]
-pub(crate) type TangentImpulse = f32;
+pub type TangentImpulse = f32;
 #[cfg(feature = "3d")]
-pub(crate) type TangentImpulse = Vec2;
+pub type TangentImpulse = Vec2;
 
 // TODO: One-body constraint version
 /// The tangential friction part of a [`ContactConstraintPoint`](super::ContactConstraintPoint).
