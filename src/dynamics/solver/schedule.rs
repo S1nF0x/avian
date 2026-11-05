@@ -148,8 +148,8 @@ pub type SolverSet = SolverSystems;
 /// 5. Detect and publish material topology changes ([`ContactBreakageSystems::Detect`] and
 ///    [`ContactBreakageSystems::Apply`])
 /// 6. Rebase affected solver poses, then refresh collider AABBs, broad-phase pairs, and manifolds
-/// 7. Roll back replaced-contact impulses from this substep, update solver bodies, rebuild the
-///    affected dynamic contact island, and perform a bounded local re-solve
+/// 7. Roll back current-substep impulses for the affected dynamic contact island, update solver
+///    bodies, rebuild its constraints, and perform a bounded local re-solve
 /// 8. Apply velocity-based constraint damping ([`SubstepSolverSystems::Damping`])
 /// 9. Integrate positions ([`IntegrationSystems::Position`])
 #[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -195,7 +195,7 @@ pub enum ContactBreakageSystems {
     RefreshNarrowPhase,
     /// Lets the material owner request the affected dynamic contact island.
     RefreshContacts,
-    /// Reverses current-substep impulses applied by replaced contact constraints.
+    /// Reverses current-substep impulses for the affected dynamic contact island.
     Rollback,
     /// Applies queued contact status changes and retires old constraints.
     Rebuild,

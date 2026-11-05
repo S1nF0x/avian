@@ -42,8 +42,8 @@ The substep pipeline now performs these operations in order:
 3. Avian refreshes changed collider AABBs, collects BVH pairs for newly
    published bodies, and updates the narrow-phase manifolds.
 4. Before contact-status changes prune old constraints, Avian refreshes
-   solver-body indices by stable entity identity and reverses the current
-   substep's net impulse for every replaced contact.
+   solver-body indices by stable entity identity and reverses current-substep
+   impulses for the affected dynamic contact island.
 5. The owner transfers a dynamic source's post-rollback rigid velocity field
    to its surviving and detached components. Avian recomputes changed mass
    properties, initializes new solver bodies, rebuilds the affected dynamic
