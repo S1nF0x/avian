@@ -808,6 +808,13 @@ impl ContactReseolveQueue {
         self.pending_all
     }
 
+    /// Returns whether contact constraints have been rebuilt and are waiting
+    /// for an application preparation hook before the bounded re-solve.
+    #[inline]
+    pub fn has_prepared_re_solve(&self) -> bool {
+        self.prepared
+    }
+
     pub(crate) fn begin_substep(&mut self) {
         // The previous substep must not leak contact authorizations. The
         // re-solve barrier normally consumes all staged entries, but an
