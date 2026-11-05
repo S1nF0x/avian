@@ -4,7 +4,7 @@ mod normal_part;
 mod tangent_part;
 
 pub use normal_part::ContactNormalPart;
-pub use tangent_part::{ContactTangentPart, TangentImpulse};
+pub use tangent_part::ContactTangentPart;
 
 use core::cmp::Ordering;
 
@@ -14,6 +14,8 @@ use crate::{
 #[cfg(feature = "serialize")]
 use bevy::reflect::{ReflectDeserialize, ReflectSerialize};
 use bevy::{prelude::Entity, reflect::Reflect, utils::default};
+
+use tangent_part::TangentImpulse;
 
 use super::solver_body::{
     SolverBodiesAccess, SolverBody, SolverBodyIndex, SolverBodyInertia,
@@ -97,8 +99,18 @@ impl ContactConstraintPoint {
     /// its two components correspond to the two orthonormal tangent directions.
     /// The ledger remains solver-owned and is exposed read-only for systems
     /// that evaluate material response from the actual solved contact.
+    #[cfg(feature = "2d")]
     #[inline]
-    pub fn substep_applied_impulses(&self) -> (f32, TangentImpulse) {
+    pub fn substep_applied_impulses(&self) -> (f32, f32) {
+        (
+            self.substep_applied_normal_impulse,
+            self.substep_applied_tangent_impulse,
+        )
+    }
+
+    #[cfg(feature = "3d")]
+    #[inline]
+    pub fn substep_applied_impulses(&self) -> (f32, bevy_math::Vec2) {
         (
             self.substep_applied_normal_impulse,
             self.substep_applied_tangent_impulse,
