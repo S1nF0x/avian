@@ -37,16 +37,17 @@ material and collider-swap proofs.
 The substep pipeline now performs these operations in order:
 
 1. The owner publishes the exact material-volume and collider replacement.
-2. Avian refreshes changed collider AABBs, collects BVH pairs for newly
+2. The owner commits the current solver pose of the affected dynamic
+   contact island to ECS Position/Rotation and rebases its solver deltas.
+3. Avian refreshes changed collider AABBs, collects BVH pairs for newly
    published bodies, and updates the narrow-phase manifolds.
-3. Before contact-status changes prune old constraints, Avian refreshes
+4. Before contact-status changes prune old constraints, Avian refreshes
    solver-body indices by stable entity identity and reverses the current
    substep's net impulse for every replaced contact.
-4. The owner transfers a dynamic source's post-rollback rigid velocity field
-   to its surviving and detached components.
-5. The owner transfers the post-rollback velocity field. Avian recomputes
-   changed mass properties, initializes new solver bodies, rebuilds the affected
-   dynamic contact island, and re-solves its constraints.
+5. The owner transfers a dynamic source's post-rollback rigid velocity field
+   to its surviving and detached components. Avian recomputes changed mass
+   properties, initializes new solver bodies, rebuilds the affected dynamic
+   contact island, and re-solves its constraints.
 6. Static and kinematic contacts remain island boundaries; a shared ground
    collider does not connect unrelated dynamic bodies.
 7. Velocity damping runs, then the current substep's position integration runs.
