@@ -1198,10 +1198,9 @@ fn rollback_requested_contact_impulses(
     }
 }
 
-/// Rebuilds the contact constraints requested by a breakage system. Existing
-/// constraints outside the requested contact set are retained, so the
-/// rebuild is local to the affected contact IDs while the following solve can
-/// still converge against all bodies in the island.
+/// Rebuilds only the contact constraints requested by a breakage system.
+/// Constraints outside the requested set retain their already-solved impulses
+/// and are not rebuilt or solved a second time in this substep.
 #[allow(clippy::too_many_arguments)]
 fn rebuild_requested_contact_constraints(
     contact_graph: Res<ContactGraph>,
