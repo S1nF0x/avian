@@ -1138,18 +1138,19 @@ fn rebuild_requested_contact_constraints(
                     let affected = requested_contacts.map_or(true, |ids| {
                         ids.binary_search(&constraint.contact_id).is_ok()
                     });
+                    // Body indices can change when a fractured dynamic
+                    // owner is removed and SolverBodies swap-removes it.
+                    // Refresh every retained constraint by stable entity identity.
+                    constraint.body_index1 = constraint
+                        .body_entity1
+                        .and_then(|entity| bodies.get(entity).ok()?.index.copied())
+                        .unwrap_or(SolverBodyIndex::INVALID);
+                    constraint.body_index2 = constraint
+                        .body_entity2
+                        .and_then(|entity| bodies.get(entity).ok()?.index.copied())
+                        .unwrap_or(SolverBodyIndex::INVALID);
+
                     if affected {
-                        // Body indices can change when a fractured dynamic
-                        // owner is removed and SolverBodies swap-removes it.
-                        // Resolve the surviving bodies by entity identity.
-                        constraint.body_index1 = constraint
-                            .body_entity1
-                            .and_then(|entity| bodies.get(entity).ok()?.index.copied())
-                            .unwrap_or(SolverBodyIndex::INVALID);
-                        constraint.body_index2 = constraint
-                            .body_entity2
-                            .and_then(|entity| bodies.get(entity).ok()?.index.copied())
-                            .unwrap_or(SolverBodyIndex::INVALID);
                         constraint.rollback_step_impulses(&access);
                     }
                 }
