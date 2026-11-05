@@ -98,6 +98,10 @@ pub struct ContactConstraint {
     /// The [`SolverBodyIndex`] of the second body in the contact,
     /// or [`SolverBodyIndex::INVALID`] if it is static or sleeping.
     pub body_index2: SolverBodyIndex,
+    /// Entity identities are retained so a contact can resolve fresh solver
+    /// indices after another body is removed during a topology edit.
+    pub(super) body_entity1: Option<Entity>,
+    pub(super) body_entity2: Option<Entity>,
     /// The relative dominance of the bodies.
     ///
     /// If the relative dominance is positive, the first body is dominant
@@ -142,6 +146,8 @@ impl ContactConstraint {
     pub(super) fn generate(
         body_index1: SolverBodyIndex,
         body_index2: SolverBodyIndex,
+        body_entity1: Option<Entity>,
+        body_entity2: Option<Entity>,
         inertia1: &SolverBodyInertia,
         inertia2: &SolverBodyInertia,
         linear_velocity1: Vector,
@@ -236,6 +242,8 @@ impl ContactConstraint {
         ContactConstraint {
             body_index1,
             body_index2,
+            body_entity1,
+            body_entity2,
             relative_dominance,
             friction: manifold.friction,
             restitution: manifold.restitution,
