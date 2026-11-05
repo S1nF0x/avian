@@ -18,7 +18,6 @@ use bevy::{prelude::Entity, reflect::Reflect, utils::default};
 use super::solver_body::{
     SolverBodiesAccess, SolverBody, SolverBodyIndex, SolverBodyInertia,
 };
-use tangent_part::TangentImpulse;
 
 /// Clamp the *applied* cached friction to the Coulomb limit of a capped
 /// normal contact. Leave ordinary contacts' existing warm start unchanged.
