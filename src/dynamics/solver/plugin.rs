@@ -974,6 +974,7 @@ fn prepare_contact_constraints(
     // request queued before the solver belongs to the same physics step and
     // is therefore satisfied by this full preparation.
     re_solve_queue.clear_pending();
+    let warm_start_enabled = narrow_phase_config.match_contacts;
     prepare_contact_constraints_internal(
         contact_graph,
         constraint_graph,
@@ -983,7 +984,7 @@ fn prepare_contact_constraints(
         narrow_phase_config,
         contact_softness,
         None,
-        narrow_phase_config.match_contacts,
+        warm_start_enabled,
     );
 }
 
