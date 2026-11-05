@@ -973,7 +973,7 @@ fn prepare_contact_constraints(
         constraint_graph,
         &mut diagnostics,
         bodies,
-        solver_bodies,
+        &solver_bodies,
         narrow_phase_config,
         contact_softness,
         None,
@@ -1177,8 +1177,6 @@ fn re_solve_requested_contacts(
     }
 
     let start = crate::utils::Instant::now();
-
-    let access = solver_bodies.access();
 
     // Do not warm-start the whole island again. Unchanged constraints have
     // already applied their warm-start and solve impulses this substep; the
