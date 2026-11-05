@@ -184,13 +184,12 @@ impl Plugin for SolverPlugin {
             emit_contact_break_events.in_set(ContactBreakageSystems::Detect),
         );
         substeps.add_systems(
-            (
-                apply_contact_status_changes,
-                rebuild_requested_contact_constraints,
-                re_solve_requested_contacts,
-            )
+            (apply_contact_status_changes, rebuild_requested_contact_constraints)
                 .chain()
-                .in_set(ContactBreakageSystems::ReSolve),
+                .in_set(ContactBreakageSystems::Rebuild),
+        );
+        substeps.add_systems(
+            re_solve_requested_contacts.in_set(ContactBreakageSystems::ReSolve),
         );
     }
 

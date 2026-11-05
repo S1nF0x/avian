@@ -66,6 +66,8 @@ impl Plugin for SolverSchedulePlugin {
                         SubstepSolverSystems::Relax,
                         ContactBreakageSystems::Detect,
                         ContactBreakageSystems::Apply,
+                        ContactBreakageSystems::Rebuild,
+                        ContactBreakageSystems::PrepareReSolve,
                         ContactBreakageSystems::ReSolve,
                         SubstepSolverSystems::Damping,
                     )
@@ -168,7 +170,11 @@ pub enum ContactBreakageSystems {
     Detect,
     /// Applies user-owned material or topology changes.
     Apply,
-    /// Rebuilds requested contacts and performs the bounded re-solve.
+    /// Applies contact status changes and rebuilds the requested constraints.
+    Rebuild,
+    /// Extension point for configuring newly rebuilt constraints before they solve.
+    PrepareReSolve,
+    /// Performs the bounded re-solve using the refreshed and configured constraints.
     ReSolve,
 }
 
