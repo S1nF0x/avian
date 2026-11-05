@@ -195,7 +195,9 @@ fn add_solver_body_inner(
     solver_bodies: &mut SolverBodies,
     commands: &mut Commands,
 ) {
-    let index = solver_bodies.push(entity, SolverBody::default(), SolverBodyInertia::default());
+    let mut body = SolverBody::default();
+    body.flags.set(SolverBodyFlags::NEEDS_INITIALIZATION, true);
+    let index = solver_bodies.push(entity, body, SolverBodyInertia::default());
     commands.entity(entity).try_insert(index);
 }
 
@@ -351,6 +353,9 @@ pub(crate) fn prepare_new_solver_bodies(
     for (rb, index, linear_velocity, angular_velocity, rotation, mass, angular_inertia, locked_axes, dominance, custom_position_integration) in &query {
         // SAFETY: Each newly added solver-body index is unique and this loop is sequential.
         let solver_body = unsafe { access.body_unchecked_mut(*index) };
+        if !solver_body.flags.contains(SolverBodyFlags::NEEDS_INITIALIZATION) {
+            continue;
+        }
         let inertial_properties = unsafe { access.inertia_unchecked_mut(*index) };
 
         solver_body.linear_velocity = linear_velocity.0;
