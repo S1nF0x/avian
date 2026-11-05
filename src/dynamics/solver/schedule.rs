@@ -138,7 +138,12 @@ pub type SolverSet = SolverSystems;
 /// 3. Solve constraints with bias ([`SubstepSolverSystems::SolveConstraints`])
 /// 4. Integrate positions ([`IntegrationSystems::Position`])
 /// 5. Solve constraints without bias to relax velocities ([`SubstepSolverSystems::Relax`])
-/// 6. Apply velocity-based constraint damping ([`SubstepSolverSystems::Damping`])
+/// 6. Detect and apply material breakage ([`ContactBreakageSystems::Detect`] and
+///    [`ContactBreakageSystems::Apply`])
+/// 7. Rebuild affected contacts, configure their new constraints, and re-solve
+///    ([`ContactBreakageSystems::Rebuild`], [`ContactBreakageSystems::PrepareReSolve`],
+///    and [`ContactBreakageSystems::ReSolve`])
+/// 8. Apply velocity-based constraint damping ([`SubstepSolverSystems::Damping`])
 #[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SubstepSolverSystems {
     /// Warm starts the solver by applying the impulses from the previous frame or substep.
@@ -161,9 +166,11 @@ pub enum SubstepSolverSystems {
 ///
 /// The [`Detect`](Self::Detect) set emits [`ContactBreakEvent`] messages after
 /// the normal relaxation pass. Applications can update their voxel/material
-/// representation and call [`ContactReseolveQueue::request_contact`] from the
-/// [`Apply`](Self::Apply) set. Avian then rebuilds those contact constraints
-/// and performs a bounded re-solve in [`ReSolve`](Self::ReSolve).
+/// representation, refresh the affected narrow-phase pairs, and acknowledge
+/// publication from the [`Apply`](Self::Apply) set. Avian rebuilds the affected
+/// constraints in [`Rebuild`](Self::Rebuild), gives applications a
+/// [`PrepareReSolve`](Self::PrepareReSolve) hook to configure those new
+/// constraints, then performs a bounded re-solve in [`ReSolve`](Self::ReSolve).
 #[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ContactBreakageSystems {
     /// Emits contact capacity failures detected by the solver.
