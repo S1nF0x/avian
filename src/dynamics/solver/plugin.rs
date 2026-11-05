@@ -1081,6 +1081,8 @@ fn prepare_contact_constraints_internal(
             let constraint = ContactConstraint::generate(
                 index1,
                 index2,
+                contact_pair.body1,
+                contact_pair.body2,
                 inertia1,
                 inertia2,
                 body1.linear_velocity.0,
@@ -1137,6 +1139,17 @@ fn rebuild_requested_contact_constraints(
                         ids.binary_search(&constraint.contact_id).is_ok()
                     });
                     if affected {
+                        // Body indices can change when a fractured dynamic
+                        // owner is removed and SolverBodies swap-removes it.
+                        // Resolve the surviving bodies by entity identity.
+                        constraint.body_index1 = constraint
+                            .body_entity1
+                            .and_then(|entity| bodies.get(entity).ok()?.index.copied())
+                            .unwrap_or(SolverBodyIndex::INVALID);
+                        constraint.body_index2 = constraint
+                            .body_entity2
+                            .and_then(|entity| bodies.get(entity).ok()?.index.copied())
+                            .unwrap_or(SolverBodyIndex::INVALID);
                         constraint.rollback_substep_impulses(&access);
                     }
                 }
