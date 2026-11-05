@@ -977,6 +977,7 @@ fn prepare_contact_constraints(
         narrow_phase_config,
         contact_softness,
         None,
+        narrow_phase_config.match_contacts,
     );
 }
 
@@ -985,10 +986,11 @@ fn prepare_contact_constraints_internal(
     mut constraint_graph: ResMut<ConstraintGraph>,
     diagnostics: &mut SolverDiagnostics,
     bodies: Query<BodyQuery, RigidBodyActiveFilter>,
-    solver_bodies: Res<SolverBodies>,
+    solver_bodies: &SolverBodies,
     narrow_phase_config: Res<NarrowPhaseConfig>,
     contact_softness: Res<ContactSoftnessCoefficients>,
     requested_contacts: Option<&[ContactId]>,
+    warm_start_enabled: bool,
 ) {
     let start = crate::utils::Instant::now();
 
@@ -1080,7 +1082,7 @@ fn prepare_contact_constraints_internal(
                 contact_pair.contact_id,
                 manifold,
                 manifold_index,
-                narrow_phase_config.match_contacts,
+                warm_start_enabled,
                 &contact_softness,
             );
 
@@ -1108,7 +1110,7 @@ fn rebuild_requested_contact_constraints(
     constraint_graph: ResMut<ConstraintGraph>,
     mut diagnostics: ResMut<SolverDiagnostics>,
     bodies: Query<BodyQuery, RigidBodyActiveFilter>,
-    solver_bodies: Res<SolverBodies>,
+    mut solver_bodies: ResMut<SolverBodies>,
     narrow_phase_config: Res<NarrowPhaseConfig>,
     contact_softness: Res<ContactSoftnessCoefficients>,
     solver_config: Res<SolverConfig>,
@@ -1117,15 +1119,36 @@ fn rebuild_requested_contact_constraints(
     let request = re_solve_queue.take_for_rebuild(solver_config.contact_re_solve_max_passes);
     if let Some(request) = request {
         let requested_contacts = request.as_deref();
+
+        // The old contact has already changed solver-body velocities.
+        // Reverse only contacts whose geometry is being replaced; untouched
+        // contacts in the island keep their already-solved state.
+        {
+            let access = solver_bodies.access();
+            for color in &mut constraint_graph.colors {
+                for constraint in &mut color.contact_constraints {
+                    let affected = requested_contacts.map_or(true, |ids| {
+                        ids.binary_search(&constraint.contact_id).is_ok()
+                    });
+                    if affected {
+                        constraint.rollback_substep_impulses(&access);
+                    }
+                }
+            }
+        }
+
+        // New geometry starts without cached impulses. The replacement
+        // contact will receive its response from the actual solver below.
         prepare_contact_constraints_internal(
             contact_graph,
             constraint_graph,
             &mut diagnostics,
             bodies,
-            solver_bodies,
+            &solver_bodies,
             narrow_phase_config,
             contact_softness,
             requested_contacts,
+            false,
         );
     }
 
@@ -1157,24 +1180,10 @@ fn re_solve_requested_contacts(
 
     let access = solver_bodies.access();
 
-    for constraint in constraint_graph.colors[COLOR_OVERFLOW_INDEX]
-        .contact_constraints
-        .iter_mut()
-    {
-        warm_start_internal(&access, constraint, solver_config.warm_start_coefficient);
-    }
-
-    for color in constraint_graph
-        .colors
-        .iter_mut()
-        .take(COLOR_OVERFLOW_INDEX)
-        .filter(|color| !color.contact_constraints.is_empty())
-    {
-        crate::utils::par_for_each(&mut color.contact_constraints, 64, |_i, constraint| {
-            warm_start_internal(&access, constraint, solver_config.warm_start_coefficient);
-        });
-    }
-
+    // Do not warm-start the whole island again. Unchanged constraints have
+    // already applied their warm-start and solve impulses this substep; the
+    // rebuilt contacts were generated without cached impulses.
+    let access = solver_bodies.access();
     let max_overlap_solve_speed = solver_config.max_overlap_solve_speed * length_unit.0;
     let delta_secs = time.delta_secs();
 
