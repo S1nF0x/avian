@@ -13,7 +13,7 @@ use crate::{
 };
 #[cfg(feature = "serialize")]
 use bevy::reflect::{ReflectDeserialize, ReflectSerialize};
-use bevy::{reflect::Reflect, utils::default};
+use bevy::{prelude::Entity, reflect::Reflect, utils::default};
 
 use super::solver_body::{
     SolverBodiesAccess, SolverBody, SolverBodyIndex, SolverBodyInertia,
@@ -476,8 +476,16 @@ impl ContactConstraint {
                     point.normal_part.impulse,
                 );
 
-                point.substep_applied_tangent_impulse += impulse;
-                point.step_applied_tangent_impulse += impulse;
+                #[cfg(feature = "2d")]
+                let tangent_impulse = impulse.dot(tangent_directions[0]);
+                #[cfg(feature = "3d")]
+                let tangent_impulse = bevy_math::Vec2::new(
+                    impulse.dot(tangent_directions[0]),
+                    impulse.dot(tangent_directions[1]),
+                );
+
+                point.substep_applied_tangent_impulse += tangent_impulse;
+                point.step_applied_tangent_impulse += tangent_impulse;
 
                 // Apply the impulse.
                 body1.linear_velocity -= impulse * inv_mass1;
