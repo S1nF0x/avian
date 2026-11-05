@@ -1193,7 +1193,7 @@ fn rollback_requested_contact_impulses(
                 .and_then(|entity| body_indices.get(entity).ok().copied())
                 .unwrap_or(SolverBodyIndex::INVALID);
 
-            constraint.rollback_step_impulses(&access);
+            constraint.rollback_substep_impulses(&access);
         }
     }
 }

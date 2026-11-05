@@ -355,13 +355,22 @@ impl ContactConstraint {
         }
     }
 
-    /// Reverses this contact's net impulse since its constraints were generated.
+    /// Reverses this contact's net impulse from the current substep.
     ///
-    /// This spans all substeps in the current physics step. It is required when
-    /// a fracture replaces the geometry that produced the contact, so the
-    /// replacement contact is solved against the new finite-mass fragments
-    /// instead of retaining impulses absorbed by the retired static collider.
+    /// Earlier substeps have already integrated their positions and remain
+    /// committed. Fracture rollback therefore reverses only the current
+    /// substep's impulse ledger, before this substep's position integration.
+    pub(crate) fn rollback_substep_impulses(&mut self, access: &SolverBodiesAccess) {
+        self.rollback_impulses(access, true);
+    }
+
+    /// Reverses this contact's net impulse since its constraints were generated.
+    /// This spans all substeps in the current physics step.
     pub(crate) fn rollback_step_impulses(&mut self, access: &SolverBodiesAccess) {
+        self.rollback_impulses(access, false);
+    }
+
+    fn rollback_impulses(&mut self, access: &SolverBodiesAccess, substep_only: bool) {
         let mut dummy_body1 = SolverBody::DUMMY;
         let mut dummy_body2 = SolverBody::DUMMY;
         let (mut body1, mut inertia1) = (&mut dummy_body1, &SolverBodyInertia::DUMMY);
@@ -393,8 +402,16 @@ impl ContactConstraint {
         let tangent_directions = self.tangent_directions();
 
         for point in &mut self.points {
-            let normal_impulse = point.step_applied_normal_impulse;
-            let tangent_impulse = point.step_applied_tangent_impulse;
+            let normal_impulse = if substep_only {
+                point.substep_applied_normal_impulse
+            } else {
+                point.step_applied_normal_impulse
+            };
+            let tangent_impulse = if substep_only {
+                point.substep_applied_tangent_impulse
+            } else {
+                point.step_applied_tangent_impulse
+            };
             #[cfg(feature = "2d")]
             let impulse = normal_impulse * self.normal
                 + tangent_impulse * tangent_directions[0];
@@ -406,8 +423,6 @@ impl ContactConstraint {
             let r1 = point.anchor1;
             let r2 = point.anchor2;
 
-            // Reverse the exact net impulse previously applied by this
-            // contact. Other contacts in the same island remain untouched.
             body1.linear_velocity += impulse * inv_mass1;
             body1.angular_velocity += inv_angular_inertia1 * cross(r1, impulse);
             body2.linear_velocity -= impulse * inv_mass2;
@@ -415,8 +430,10 @@ impl ContactConstraint {
 
             point.substep_applied_normal_impulse = 0.0;
             point.substep_applied_tangent_impulse = default();
-            point.step_applied_normal_impulse = 0.0;
-            point.step_applied_tangent_impulse = default();
+            if !substep_only {
+                point.step_applied_normal_impulse = 0.0;
+                point.step_applied_tangent_impulse = default();
+            }
         }
     }
 
