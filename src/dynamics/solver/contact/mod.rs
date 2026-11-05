@@ -82,14 +82,6 @@ pub struct ContactConstraintPoint {
 
     /// Net friction impulse applied to this point during the current substep.
     pub(crate) substep_applied_tangent_impulse: TangentImpulse,
-
-    /// Net normal impulse applied since this contact constraint was generated.
-    /// This spans every substep in the current physics step and is used to
-    /// reverse a retired contact before rebuilding its replacement.
-    pub(crate) step_applied_normal_impulse: f32,
-
-    /// Net friction impulse applied since this contact constraint was generated.
-    pub(crate) step_applied_tangent_impulse: TangentImpulse,
 }
 
 impl ContactConstraintPoint {
@@ -265,8 +257,6 @@ impl ContactConstraint {
                 initial_separation: -point.penetration - (anchor2 - anchor1).dot(manifold.normal),
                 substep_applied_normal_impulse: 0.0,
                 substep_applied_tangent_impulse: default(),
-                step_applied_normal_impulse: 0.0,
-                step_applied_tangent_impulse: default(),
             };
 
             point
@@ -336,8 +326,6 @@ impl ContactConstraint {
             );
             point.substep_applied_normal_impulse += normal_impulse;
             point.substep_applied_tangent_impulse += tangent_impulse;
-            point.step_applied_normal_impulse += normal_impulse;
-            point.step_applied_tangent_impulse += tangent_impulse;
 
             #[cfg(feature = "2d")]
             let p = normal_impulse * self.normal
