@@ -855,7 +855,7 @@ impl ContactReseolveQueue {
         self.pending_all || !self.pending.is_empty() || !self.staged_fractures.is_empty()
     }
 
-    /// Seals fracture tickets and returns the contact IDs whose already-applied impulses
+    /// Seals fracture tickets and returns the contact IDs whose current-substep impulses
     /// must be reversed before contact-status changes can prune their constraints.
     ///
     /// The request is not consumed here; the same IDs are retained for constraint rebuilding

@@ -40,8 +40,8 @@ The substep pipeline now performs these operations in order:
 2. Avian refreshes changed collider AABBs, collects BVH pairs for newly
    published bodies, and updates the narrow-phase manifolds.
 3. Before contact-status changes prune old constraints, Avian refreshes
-   solver-body indices by stable entity identity and reverses the net impulse
-   applied by every replaced contact since that constraint graph was built.
+   solver-body indices by stable entity identity and reverses the current
+   substep's net impulse for every replaced contact.
 4. The owner transfers a dynamic source's post-rollback rigid velocity field
    to its surviving and detached components.
 5. Avian recomputes changed mass properties, initializes new solver bodies,
@@ -52,12 +52,12 @@ New fragments can therefore create ordinary contact constraints with the
 impactor and neighboring bodies in the same substep. Unchanged constraints
 retain their already-solved state and are not solved a second time.
 
-This is a local contact transaction, not a bit-for-bit replay of the entire
-fixed step or contact island. Positions committed by earlier substeps remain
-committed; joints, CCD, and end-of-step restitution are not rolled back and
-replayed as part of the fracture transaction. The current substep's position
-integration is deliberately deferred until after the replacement contacts
-have been solved. Cross-platform deterministic replay is not claimed.
+This is a local substep contact transaction, not a bit-for-bit replay of the
+entire fixed step or contact island. Impulses and positions committed by
+earlier substeps remain committed; only the current substep's replaced-contact
+impulses are reversed before its position integration. Joints, CCD, and
+end-of-step restitution are not rolled back and replayed as part of the
+fracture transaction. Cross-platform deterministic replay is not claimed.
 
 Owner responsibilities remain unchanged:
 - Validate the source revision and exact material ledger before committing topology.
