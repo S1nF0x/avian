@@ -326,6 +326,62 @@ fn prepare_solver_bodies(
     );
 }
 
+/// Initializes solver state for dynamic bodies created during a contact-breakage
+/// substep. Their SolverBodyIndex is inserted by the rigid-body observer, but
+/// the normal PhysicsSchedule preparation pass has already run. Without this
+/// synchronization, a fresh fragment has zero inverse mass during the
+/// same-substep contact rebuild and behaves like a static body.
+pub(crate) fn prepare_new_solver_bodies(
+    mut solver_bodies: ResMut<SolverBodies>,
+    query: Query<(
+        &RigidBody,
+        &SolverBodyIndex,
+        &LinearVelocity,
+        &AngularVelocity,
+        &Rotation,
+        &ComputedMass,
+        &ComputedAngularInertia,
+        Option<&LockedAxes>,
+        Option<&Dominance>,
+        Has<CustomPositionIntegration>,
+    ), Added<SolverBodyIndex>>,
+) {
+    let access = solver_bodies.access();
+
+    for (rb, index, linear_velocity, angular_velocity, rotation, mass, angular_inertia, locked_axes, dominance, custom_position_integration) in &query {
+        // SAFETY: Each newly added solver-body index is unique and this loop is sequential.
+        let solver_body = unsafe { access.body_unchecked_mut(*index) };
+        let inertial_properties = unsafe { access.inertia_unchecked_mut(*index) };
+
+        solver_body.linear_velocity = linear_velocity.0;
+        solver_body.angular_velocity = angular_velocity.0;
+        solver_body.delta_position = Vector::ZERO;
+        solver_body.delta_rotation = Rot::IDENTITY;
+
+        let locked_axes = locked_axes.copied().unwrap_or_default();
+        *inertial_properties = SolverBodyInertia::new(
+            mass.inverse(),
+            #[cfg(feature = "2d")]
+            angular_inertia.inverse(),
+            #[cfg(feature = "3d")]
+            angular_inertia.rotated(rotation.0).inverse(),
+            locked_axes,
+            dominance.map_or(0, |dominance| dominance.0),
+            rb.is_dynamic(),
+        );
+        solver_body.flags = SolverBodyFlags(locked_axes.to_bits() as u32);
+        solver_body.flags.set(SolverBodyFlags::IS_KINEMATIC, rb.is_kinematic());
+        solver_body.flags.set(SolverBodyFlags::CUSTOM_POSITION_INTEGRATION, custom_position_integration);
+
+        #[cfg(feature = "3d")]
+        {
+            let epsilon = 1e-6;
+            let is_gyroscopic = !locked_axes.is_rotation_locked()
+                && !angular_inertia.inverse().is_isotropic(epsilon);
+            solver_body.flags.set(SolverBodyFlags::GYROSCOPIC_MOTION, is_gyroscopic);
+        }
+    }
+}
 /// Writes back solver body data to rigid bodies.
 #[allow(clippy::type_complexity)]
 fn writeback_solver_bodies(
