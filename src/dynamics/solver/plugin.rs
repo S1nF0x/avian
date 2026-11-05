@@ -1150,7 +1150,7 @@ fn rebuild_requested_contact_constraints(
                             .body_entity2
                             .and_then(|entity| bodies.get(entity).ok()?.index.copied())
                             .unwrap_or(SolverBodyIndex::INVALID);
-                        constraint.rollback_substep_impulses(&access);
+                        constraint.rollback_step_impulses(&access);
                     }
                 }
             }
