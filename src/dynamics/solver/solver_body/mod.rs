@@ -12,7 +12,7 @@
 mod plugin;
 
 pub use plugin::SolverBodyPlugin;
-pub(crate) use plugin::prepare_new_solver_bodies;
+pub(crate) use plugin::{prepare_new_solver_bodies, update_new_solver_body_mass_properties};
 
 use core::marker::PhantomData;
 
