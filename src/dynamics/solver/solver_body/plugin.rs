@@ -13,8 +13,8 @@ use crate::{
     },
     math::ToRealPrecision,
     prelude::{
-        AppDiagnosticsExt, ComputedAngularInertia, ComputedCenterOfMass, ComputedMass, Dominance,
-        LockedAxes, MassPropertyHelper,
+        AngularInertia, AppDiagnosticsExt, CenterOfMass, ComputedAngularInertia,
+        ComputedCenterOfMass, ComputedMass, Dominance, LockedAxes, Mass, MassPropertyHelper,
     },
     utils::{MIN_PAR_ITER_ENTITIES, ParallelQueryForEach},
 };
@@ -340,8 +340,6 @@ pub(crate) fn update_new_solver_body_mass_properties(
                 Changed<Mass>,
                 Changed<AngularInertia>,
                 Changed<CenterOfMass>,
-                Changed<ColliderMassProperties>,
-                Changed<ColliderTransform>,
             )>,
         ),
     >,
@@ -405,18 +403,20 @@ pub(crate) fn prepare_new_solver_bodies(
             dominance.map_or(0, |dominance| dominance.0),
             rb.is_dynamic(),
         );
-        let mut flags = SolverBodyFlags(locked_axes.to_bits() as u32);
-        flags.set(SolverBodyFlags::IS_KINEMATIC, rb.is_kinematic());
-        flags.set(SolverBodyFlags::CUSTOM_POSITION_INTEGRATION, custom_position_integration);
+        if needs_initialization {
+            let mut flags = SolverBodyFlags(locked_axes.to_bits() as u32);
+            flags.set(SolverBodyFlags::IS_KINEMATIC, rb.is_kinematic());
+            flags.set(SolverBodyFlags::CUSTOM_POSITION_INTEGRATION, custom_position_integration);
 
-        #[cfg(feature = "3d")]
-        {
-            let epsilon = 1e-6;
-            let is_gyroscopic = !locked_axes.is_rotation_locked()
-                && !angular_inertia.inverse().is_isotropic(epsilon);
-            flags.set(SolverBodyFlags::GYROSCOPIC_MOTION, is_gyroscopic);
+            #[cfg(feature = "3d")]
+            {
+                let epsilon = 1e-6;
+                let is_gyroscopic = !locked_axes.is_rotation_locked()
+                    && !angular_inertia.inverse().is_isotropic(epsilon);
+                flags.set(SolverBodyFlags::GYROSCOPIC_MOTION, is_gyroscopic);
+            }
+            solver_body.flags = flags;
         }
-        solver_body.flags = flags;
     }
 }
 /// Writes back solver body data to rigid bodies.
