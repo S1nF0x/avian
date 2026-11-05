@@ -28,9 +28,9 @@ authorization** on `ContactReseolveQueue`:
    A ticket from a previous episode/substep cannot publish a contact that
    reused the same `ContactId`.
 
-The client example in `S1nF0x/ccc` uses the ticket after an exact,
-revision-checked resident cut and clean collider dirty-brick journal.
-The application, not Avian, owns voxel material and collider-swap proofs.
+The `S1nF0x/reasons` client uses the ticket after an exact, revision-checked
+resident cut and collider publication. The application, not Avian, owns voxel
+material and collider-swap proofs.
 
 ## Guarantees and boundaries
 
@@ -44,13 +44,18 @@ The substep pipeline now performs these operations in order:
    substep's net impulse for every replaced contact.
 4. The owner transfers a dynamic source's post-rollback rigid velocity field
    to its surviving and detached components.
-5. Avian recomputes changed mass properties, initializes new solver bodies,
-   rebuilds only requested constraints, and solves only those constraints.
-6. Velocity damping runs, then the current substep's position integration runs.
+5. The owner transfers the post-rollback velocity field. Avian recomputes
+   changed mass properties, initializes new solver bodies, rebuilds the affected
+   dynamic contact island, and re-solves its constraints.
+6. Static and kinematic contacts remain island boundaries; a shared ground
+   collider does not connect unrelated dynamic bodies.
+7. Velocity damping runs, then the current substep's position integration runs.
 
 New fragments can therefore create ordinary contact constraints with the
-impactor and neighboring bodies in the same substep. Unchanged constraints
-retain their already-solved state and are not solved a second time.
+impactor and neighboring bodies in the same substep. Every dynamic body whose
+velocity is changed by rollback brings its other contacts into the same local
+island re-solve. Constraints outside that island retain their already-solved
+state and are not solved a second time.
 
 This is a local substep contact transaction, not a bit-for-bit replay of the
 entire fixed step or contact island. Impulses and positions committed by
@@ -79,6 +84,6 @@ cargo test -p avian3d contact_re_solve_tests
 cargo test -p avian3d
 ```
 
-This connector session cannot execute Cargo. The changes were committed to
-the fork main branch and adopted by `ccc` through an exact pinned Git SHA,
-but no green CI/test result is asserted here.
+This connector session cannot execute Cargo. The changes are committed directly
+to the fork main branch and consumed by the Reasons client through its git
+dependency. No local Cargo test result is asserted here.
