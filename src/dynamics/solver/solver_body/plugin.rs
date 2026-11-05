@@ -332,7 +332,7 @@ fn prepare_solver_bodies(
 /// stage. The rigid-body observer runs before the separately inserted
 /// MassPropertiesBundle, so its initial computed values may be stale.
 pub(crate) fn update_new_solver_body_mass_properties(
-    query: Query<Entity, Added<SolverBodyIndex>>,
+    query: Query<Entity, Changed<SolverBodyIndex>>,
     mut mass_helper: MassPropertyHelper,
 ) {
     for entity in &query {
@@ -358,7 +358,7 @@ pub(crate) fn prepare_new_solver_bodies(
         Option<&LockedAxes>,
         Option<&Dominance>,
         Has<CustomPositionIntegration>,
-    ), Added<SolverBodyIndex>>,
+    ), Changed<SolverBodyIndex>>,
 ) {
     let access = solver_bodies.access();
 
