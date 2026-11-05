@@ -802,6 +802,28 @@ impl ContactReseolveQueue {
         }
     }
 
+    /// Requests a bounded batch of contact rebuilds. If the batch would exceed
+    /// the local queue capacity, it safely falls back to a full graph rebuild
+    /// rather than silently dropping contacts from a topology transaction.
+    pub fn request_contacts(
+        &mut self,
+        contact_ids: impl IntoIterator<Item = ContactId>,
+    ) {
+        if self.pending_all {
+            return;
+        }
+        for contact_id in contact_ids {
+            if self.pending.contains(&contact_id) {
+                continue;
+            }
+            if self.pending.len() >= MAX_PENDING_CONTACT_REBUILDS {
+                self.request_all();
+                return;
+            }
+            self.pending.push(contact_id);
+        }
+    }
+
     /// Requests a bounded re-solve for every active contact constraint.
     #[inline]
     pub fn request_all(&mut self) {
@@ -1882,6 +1904,20 @@ mod contact_re_solve_tests {
         queue.begin_substep();
         queue.request_all();
 
+        assert_eq!(queue.contacts_for_rollback(), Some(None));
+        assert_eq!(queue.take_for_rebuild(1), Some(None));
+        assert_eq!(queue.take_prepared_contacts(), Some(None));
+    }
+
+    #[test]
+    fn bulk_fracture_contact_requests_fall_back_to_full_graph() {
+        let mut queue = ContactReseolveQueue::default();
+        queue.begin_substep();
+        queue.request_contacts((0..MAX_PENDING_CONTACT_REBUILDS).map(|id| ContactId(id as u32)));
+        assert_eq!(queue.pending_contact_count(), MAX_PENDING_CONTACT_REBUILDS);
+
+        queue.request_contacts([ContactId(MAX_PENDING_CONTACT_REBUILDS as u32)]);
+        assert_eq!(queue.pending_contact_count(), 0);
         assert_eq!(queue.contacts_for_rollback(), Some(None));
         assert_eq!(queue.take_for_rebuild(1), Some(None));
         assert_eq!(queue.take_prepared_contacts(), Some(None));
