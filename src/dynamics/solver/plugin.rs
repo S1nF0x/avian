@@ -14,8 +14,8 @@ use crate::{
             schedule::{ContactBreakageSystems, SubstepSolverSystems},
             softness_parameters::{SoftnessCoefficients, SoftnessParameters},
             solver_body::{
-                prepare_new_solver_bodies, SolverBodies, SolverBodiesAccess, SolverBody,
-                SolverBodyIndex, SolverBodyInertia,
+                prepare_new_solver_bodies, update_new_solver_body_mass_properties,
+                SolverBodies, SolverBodiesAccess, SolverBody, SolverBodyIndex, SolverBodyInertia,
             },
         },
     },
@@ -187,6 +187,7 @@ impl Plugin for SolverPlugin {
         substeps.add_systems(
             (
                 apply_contact_status_changes,
+                update_new_solver_body_mass_properties,
                 prepare_new_solver_bodies,
                 rebuild_requested_contact_constraints,
             )
