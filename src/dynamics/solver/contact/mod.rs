@@ -4,7 +4,7 @@ mod normal_part;
 mod tangent_part;
 
 pub use normal_part::ContactNormalPart;
-pub use tangent_part::ContactTangentPart;
+pub use tangent_part::{ContactTangentPart, TangentImpulse};
 
 use core::cmp::Ordering;
 
@@ -53,6 +53,20 @@ fn warm_start_tangent_impulse(
 #[cfg_attr(feature = "serialize", reflect(Serialize, Deserialize))]
 #[reflect(Debug, PartialEq)]
 pub struct ContactConstraintPoint {
+    /// Returns the net contact impulses applied during the current substep.
+    ///
+    /// The tangent impulse is expressed in the contact's tangent basis. In 3D,
+    /// its two components correspond to the two orthonormal tangent directions.
+    /// The ledger remains solver-owned and is exposed read-only for systems
+    /// that evaluate material response from the actual solved contact.
+    #[inline]
+    pub fn substep_applied_impulses(&self) -> (f32, TangentImpulse) {
+        (
+            self.substep_applied_normal_impulse,
+            self.substep_applied_tangent_impulse,
+        )
+    }
+
     /// The normal part of the contact constraint.
     pub normal_part: ContactNormalPart,
 
