@@ -1053,25 +1053,25 @@ fn re_solve_requested_contacts(
     let max_overlap_solve_speed = solver_config.max_overlap_solve_speed * length_unit.0;
     let delta_secs = time.delta_secs();
 
+    // A topology replacement happens after this substep's positions have
+    // already been integrated. Newly discovered contacts can begin deeply
+    // overlapped because voxel cells were converted into separate rigid bodies
+    // at their existing world positions. Applying positional bias a second
+    // time turns that representation overlap into an artificial impact.
+    // Re-solve only physical velocity constraints; do not apply a second
+    // positional-correction pass within the same substep.
     for constraint in constraint_graph.colors[COLOR_OVERFLOW_INDEX]
         .contact_constraints
         .iter_mut()
     {
-        if !is_requested(constraint.contact_id) {
-            continue;
+        if is_requested(constraint.contact_id) {
+            solve_contacts_internal::<false>(
+                &access,
+                constraint,
+                max_overlap_solve_speed,
+                delta_secs,
+            );
         }
-        solve_contacts_internal::<true>(
-            &access,
-            constraint,
-            max_overlap_solve_speed,
-            delta_secs,
-        );
-        solve_contacts_internal::<false>(
-            &access,
-            constraint,
-            max_overlap_solve_speed,
-            delta_secs,
-        );
     }
 
     for color in constraint_graph
@@ -1081,21 +1081,14 @@ fn re_solve_requested_contacts(
         .filter(|color| !color.contact_constraints.is_empty())
     {
         crate::utils::par_for_each(&mut color.contact_constraints, 64, |_i, constraint| {
-            if !is_requested(constraint.contact_id) {
-                return;
+            if is_requested(constraint.contact_id) {
+                solve_contacts_internal::<false>(
+                    &access,
+                    constraint,
+                    max_overlap_solve_speed,
+                    delta_secs,
+                );
             }
-            solve_contacts_internal::<true>(
-                &access,
-                constraint,
-                max_overlap_solve_speed,
-                delta_secs,
-            );
-            solve_contacts_internal::<false>(
-                &access,
-                constraint,
-                max_overlap_solve_speed,
-                delta_secs,
-            );
         });
     }
 
