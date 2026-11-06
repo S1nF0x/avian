@@ -932,6 +932,17 @@ fn prepare_contact_constraints_internal(
                 .get_inertia(index2)
                 .unwrap_or(&SolverBodyInertia::DUMMY);
 
+            // The ECS velocity components are written back only after the
+            // fixed-step solver finishes. During a same-substep topology
+            // rebuild, SolverBodies already contains the post-integration and
+            // post-rollback velocities and must remain authoritative.
+            let linear_velocity1 = solver_bodies
+                .get(index1)
+                .map_or(body1.linear_velocity.0, |body| body.linear_velocity);
+            let linear_velocity2 = solver_bodies
+                .get(index2)
+                .map_or(body2.linear_velocity.0, |body| body.linear_velocity);
+
             let constraint = ContactConstraint::generate(
                 index1,
                 index2,
@@ -939,8 +950,8 @@ fn prepare_contact_constraints_internal(
                 contact_pair.body2,
                 inertia1,
                 inertia2,
-                body1.linear_velocity.0,
-                body2.linear_velocity.0,
+                linear_velocity1,
+                linear_velocity2,
                 contact_pair.contact_id,
                 manifold,
                 manifold_index,
