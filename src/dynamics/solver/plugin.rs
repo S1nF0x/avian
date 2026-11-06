@@ -989,13 +989,14 @@ fn prepare_contact_constraints_internal(
 }
 
 /// Reverses affected contact impulses before contact-status changes can
-/// remove their old constraints. Solver bodies are not rebuilt until the later
-/// PrepareSolverBodies stage, so the constraint's original indices are still
-/// valid here even when its source ECS entity has already been despawned.
+/// remove their old constraints. A topology publication may despawn a body;
+/// Avian's removal observer swap-removes its solver body immediately. Resolve
+/// both indices by entity so a stale slot is never applied to the swapped body.
 fn rollback_requested_contact_impulses(
     mut solver_bodies: ResMut<SolverBodies>,
     mut constraint_graph: ResMut<ConstraintGraph>,
     mut re_solve_queue: ResMut<ContactReseolveQueue>,
+    body_indices: Query<&SolverBodyIndex>,
 ) {
     let Some(requested_contacts) = re_solve_queue.contacts_for_rollback() else {
         return;
@@ -1007,9 +1008,20 @@ fn rollback_requested_contact_impulses(
             let affected = requested_contacts.as_ref().is_none_or(|ids| {
                 ids.binary_search(&constraint.contact_id).is_ok()
             });
-            if affected {
-                constraint.rollback_substep_impulses(&access);
+            if !affected {
+                continue;
             }
+
+            constraint.body_index1 = constraint
+                .body_entity1
+                .and_then(|entity| body_indices.get(entity).ok().copied())
+                .unwrap_or(SolverBodyIndex::INVALID);
+            constraint.body_index2 = constraint
+                .body_entity2
+                .and_then(|entity| body_indices.get(entity).ok().copied())
+                .unwrap_or(SolverBodyIndex::INVALID);
+
+            constraint.rollback_substep_impulses(&access);
         }
     }
 }
