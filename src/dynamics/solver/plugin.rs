@@ -657,7 +657,7 @@ impl ContactReseolveQueue {
     }
 
     /// Whether the refreshed constraints are ready for material configuration.
-    pub(crate) fn has_prepared_re_solve(&self) -> bool {
+    pub fn has_prepared_re_solve(&self) -> bool {
         self.prepared_contacts.is_some()
     }
 
