@@ -656,6 +656,11 @@ impl ContactReseolveQueue {
         !self.pending.is_empty()
     }
 
+    /// Whether the refreshed constraints are ready for material configuration.
+    pub(crate) fn has_prepared_re_solve(&self) -> bool {
+        self.prepared_contacts.is_some()
+    }
+
     /// Returns the old constraints whose current-substep impulses must be
     /// reversed before contact-status changes retire their manifolds.
     pub(crate) fn contacts_for_rollback(&mut self) -> Option<Vec<ContactId>> {
