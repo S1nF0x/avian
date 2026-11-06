@@ -706,6 +706,10 @@ impl ContactReseolveQueue {
             self.pending_all = false;
             None
         } else {
+            // The rollback stage sorts the old island, but newly discovered
+            // contacts are appended after narrow-phase refresh. Sort again
+            // before binary-search-based constraint filtering and re-solving.
+            self.pending.sort_unstable();
             Some(core::mem::take(&mut self.pending))
         };
         self.prepared_contacts = Some(requested_contacts.clone());
@@ -1667,6 +1671,25 @@ mod contact_re_solve_tests {
             Some(Some(vec![ContactId(7), ContactId(12), ContactId(18)])),
         );
     }
+
+    #[test]
+    fn contacts_added_after_rollback_are_sorted_before_rebuild() {
+        let mut queue = ContactReseolveQueue::default();
+        queue.request_contacts([ContactId(12), ContactId(18)]);
+
+        assert_eq!(
+            queue.contacts_for_rollback(),
+            Some(Some(vec![ContactId(12), ContactId(18)])),
+        );
+
+        // The narrow phase can discover contacts after the rollback stage.
+        queue.request_contacts([ContactId(30), ContactId(7), ContactId(12)]);
+
+        let expected = vec![ContactId(7), ContactId(12), ContactId(18), ContactId(30)];
+        assert_eq!(queue.take_for_rebuild(), Some(Some(expected.clone())));
+        assert_eq!(queue.take_prepared_contacts(), Some(Some(expected)));
+    }
+
 }
 
 /// Inverts a summed inverse inertia on its non-zero axes, so a locked axis doesn't zero the whole inverse.
