@@ -149,7 +149,7 @@ pub type SolverSet = SolverSystems;
 ///    [`ContactBreakageSystems::Apply`])
 /// 6. Rebase affected solver poses, then refresh collider AABBs, broad-phase pairs, and manifolds
 /// 7. Roll back current-substep impulses for the affected dynamic contact island, update solver
-///    bodies, rebuild its constraints, and perform a bounded local re-solve
+///    bodies, rebuild its constraints, and perform one local re-solve
 /// 8. Apply velocity-based constraint damping ([`SubstepSolverSystems::Damping`])
 /// 9. Integrate positions ([`IntegrationSystems::Position`])
 #[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -180,7 +180,7 @@ pub enum SubstepSolverSystems {
 /// impulses from replaced contacts. [`PrepareBodies`](Self::PrepareBodies) lets the
 /// owner transfer post-rollback rigid velocity to its new fragments. Avian updates
 /// solver bodies, rebuilds only requested constraints, and exposes
-/// [`PrepareReSolve`](Self::PrepareReSolve) before the bounded [`ReSolve`](Self::ReSolve).
+/// [`PrepareReSolve`](Self::PrepareReSolve) before the single [`ReSolve`](Self::ReSolve).
 #[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ContactBreakageSystems {
     /// Emits contact capacity failures detected by the solver.
@@ -207,7 +207,7 @@ pub enum ContactBreakageSystems {
     RebuildConstraints,
     /// Extension point for configuring newly rebuilt constraints before they solve.
     PrepareReSolve,
-    /// Performs the bounded re-solve using the refreshed and configured constraints.
+    /// Performs one re-solve using the refreshed and configured constraints.
     ReSolve,
 }
 

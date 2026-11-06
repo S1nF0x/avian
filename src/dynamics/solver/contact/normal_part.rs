@@ -27,9 +27,8 @@ pub struct ContactNormalPart {
     /// a safe physics boundary; this method never mutates colliders.
     pub capacity_exceeded: bool,
 
-    /// The largest uncapped accumulated impulse requested by the current
-    /// solve. This is exposed for breakage diagnostics and is reset when a new
-    /// contact constraint is generated.
+    /// The largest uncapped accumulated impulse requested during this
+    /// substep. This is exposed for breakage diagnostics and reset at warm start.
     pub last_requested_impulse: f32,
 
     /// The total normal impulse applied across substeps and restitution.
@@ -143,6 +142,12 @@ impl ContactNormalPart {
         // Warm-start values from a stronger previous contact are not allowed
         // to bypass the new material constraint.
         self.impulse = self.impulse.clamp(0.0, self.max_impulse);
+    }
+
+    /// Clears the transient material-failure signal for a new solver substep.
+    pub(crate) fn reset_substep_state(&mut self) {
+        self.capacity_exceeded = false;
+        self.last_requested_impulse = 0.0;
     }
 
     /// Returns the *applied* warm-start normal impulse. Scaling a cached
@@ -300,6 +305,21 @@ mod material_capacity_tests {
         normal.set_maximum_normal_impulse(0.0);
         assert_eq!(normal.warm_start_impulse(2.0), 0.0);
         assert_eq!(normal.warm_start_impulse(f32::NAN), 0.0);
+    }
+
+    #[test]
+    fn capacity_breach_is_scoped_to_one_substep() {
+        let mut normal = part(0.0);
+        normal.set_maximum_normal_impulse(5.0);
+        normal.clamp_accumulated_impulse(8.0);
+        assert!(normal.capacity_exceeded);
+        assert_eq!(normal.last_requested_impulse, 8.0);
+
+        normal.reset_substep_state();
+
+        assert!(!normal.capacity_exceeded);
+        assert_eq!(normal.last_requested_impulse, 0.0);
+        assert_eq!(normal.impulse, 5.0);
     }
 
     #[test]

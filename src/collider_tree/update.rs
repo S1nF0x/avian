@@ -1103,3 +1103,65 @@ fn clear_moved_proxies(mut moved_proxies: ResMut<MovedProxies>, mut trees: ResMu
     moved_proxies.clear();
     trees.iter_trees_mut().for_each(|t| t.moved_proxies.clear());
 }
+
+#[cfg(test)]
+#[cfg(feature = "default-collider")]
+mod tests {
+    use super::*;
+    use bevy::time::TimeUpdateStrategy;
+    use core::time::Duration;
+
+    /// Removing a collider's rigid body (Case 3) moves its proxy to the
+    /// standalone tree. The `ColliderTreeProxyKey` on the entity has to follow,
+    /// or the entity is left addressing a slot in the old tree that it no
+    /// longer owns.
+    #[test]
+    fn removing_rigid_body_updates_proxy_key() {
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            TransformPlugin,
+            PhysicsPlugins::default(),
+            bevy::asset::AssetPlugin::default(),
+            #[cfg(feature = "collider-from-mesh")]
+            bevy::mesh::MeshPlugin,
+        ))
+        .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f64(
+            1.0 / 60.0,
+        )));
+        app.finish();
+
+        fn proxy_key(app: &App, entity: Entity) -> ColliderTreeProxyKey {
+            *app.world().get::<ColliderTreeProxyKey>(entity).unwrap()
+        }
+
+        let collider = app
+            .world_mut()
+            .spawn((
+                RigidBody::Static,
+                Collider::capsule(0.5, 2.0),
+                Transform::default(),
+            ))
+            .id();
+        app.update();
+
+        assert!(proxy_key(&app, collider).is_static());
+
+        app.world_mut().entity_mut(collider).remove::<RigidBody>();
+        app.update();
+
+        let key = proxy_key(&app, collider);
+        let trees = app.world().resource::<ColliderTrees>();
+        assert!(
+            key.is_standalone(),
+            "proxy key should point to the standalone tree after the body is removed, got {key:?}"
+        );
+        assert_eq!(
+            trees.get_proxy(key).map(|p| p.collider),
+            Some(collider),
+            "proxy key should resolve to this collider's own proxy"
+        );
+        assert_eq!(trees.static_tree.proxies.len(), 0);
+        assert_eq!(trees.standalone_tree.proxies.len(), 1);
+    }
+}

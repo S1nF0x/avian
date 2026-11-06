@@ -304,6 +304,7 @@ impl ContactConstraint {
         let tangent_directions = self.tangent_directions();
 
         for point in self.points.iter_mut() {
+            point.normal_part.reset_substep_state();
             // The ledger is local to this substep. It records the complete
             // impulse applied to the bodies, not only the solver's accumulated
             // lambda delta, so a topology edit can reverse a stale contact.

@@ -636,108 +636,54 @@ impl Default for SolverConfig {
 }
 
 /// Contact constraints invalidated by an authoritative topology change.
-///
-/// Requests are collected before AABB refresh and consumed once after the
-/// refreshed broad/narrow phase. Overflow falls back to rebuilding the full
-/// contact graph; a published fracture is never silently dropped.
-/// Maximum number of local contact IDs retained before rebuilding the full graph.
-const MAX_PENDING_CONTACT_REBUILDS: usize = 1024;
-
 #[derive(Resource, Debug, Default)]
 pub struct ContactReseolveQueue {
     pending: Vec<ContactId>,
-    pending_all: bool,
-    prepared_contacts: Option<Option<Vec<ContactId>>>,
+    prepared_contacts: Option<Vec<ContactId>>,
 }
 
 impl ContactReseolveQueue {
-    /// Requests a batch of contact pairs. Overflow safely falls back to the
-    /// full graph rather than dropping a topology transaction.
+    /// Requests contacts for rollback and one local re-solve.
     pub fn request_contacts(
         &mut self,
         contact_ids: impl IntoIterator<Item = ContactId>,
     ) {
-        if self.pending_all {
-            return;
-        }
-
-        for contact_id in contact_ids {
-            if self.pending.contains(&contact_id) {
-                continue;
-            }
-            if self.pending.len() >= MAX_PENDING_CONTACT_REBUILDS {
-                self.request_all();
-                return;
-            }
-            self.pending.push(contact_id);
-        }
-    }
-
-    /// Requests a full contact-graph rollback, rebuild, and re-solve.
-    #[inline]
-    fn request_all(&mut self) {
-        self.pending.clear();
-        self.pending_all = true;
-    }
-
-    /// Whether a requested contact rebuild has been prepared for re-solving.
-    pub fn has_prepared_re_solve(&self) -> bool {
-        self.prepared_contacts.is_some()
+        self.pending.extend(contact_ids);
     }
 
     /// Whether topology publication requires the standard collider refresh pipeline.
     pub(crate) fn has_pending_rebuild(&self) -> bool {
-        self.pending_all || !self.pending.is_empty()
+        !self.pending.is_empty()
     }
 
-    /// Returns the exact constraints whose current-substep impulses must be
-    /// reversed before old contact constraints are pruned.
-    pub(crate) fn contacts_for_rollback(&mut self) -> Option<Option<Vec<ContactId>>> {
-        if self.pending_all {
-            Some(None)
-        } else if self.pending.is_empty() {
-            None
-        } else {
-            self.pending.sort_unstable();
-            Some(Some(self.pending.clone()))
-        }
-    }
-
-    fn take_for_rebuild(&mut self) -> Option<Option<Vec<ContactId>>> {
-        if !self.pending_all && self.pending.is_empty() {
+    /// Returns the old constraints whose current-substep impulses must be
+    /// reversed before contact-status changes retire their manifolds.
+    pub(crate) fn contacts_for_rollback(&mut self) -> Option<Vec<ContactId>> {
+        if self.pending.is_empty() {
             return None;
         }
-
-        let requested_contacts = if self.pending_all {
-            self.pending_all = false;
-            None
-        } else {
-            // The rollback stage sorts the old island, but newly discovered
-            // contacts are appended after narrow-phase refresh. Sort again
-            // before binary-search-based constraint filtering and re-solving.
-            self.pending.sort_unstable();
-            Some(core::mem::take(&mut self.pending))
-        };
-        self.prepared_contacts = Some(requested_contacts.clone());
-        Some(requested_contacts)
+        self.pending.sort_unstable();
+        self.pending.dedup();
+        Some(self.pending.clone())
     }
 
-    fn take_prepared_contacts(&mut self) -> Option<Option<Vec<ContactId>>> {
+    fn take_for_rebuild(&mut self) -> Option<Vec<ContactId>> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        self.pending.sort_unstable();
+        self.pending.dedup();
+        let requested = core::mem::take(&mut self.pending);
+        self.prepared_contacts = Some(requested.clone());
+        Some(requested)
+    }
+
+    fn take_prepared_contacts(&mut self) -> Option<Vec<ContactId>> {
         core::mem::take(&mut self.prepared_contacts)
-    }
-
-    /// Starts a fresh transaction for each solver substep.
-    ///
-    /// Requests are valid only for the substep in which the authoritative
-    /// topology was published. An interrupted transaction must never be
-    /// replayed against a later substep's contact graph.
-    pub(crate) fn begin_substep(&mut self) {
-        self.clear_pending();
     }
 
     fn clear_pending(&mut self) {
         self.pending.clear();
-        self.pending_all = false;
         self.prepared_contacts = None;
     }
 }
@@ -1003,9 +949,7 @@ fn rollback_requested_contact_impulses(
     let access = solver_bodies.access();
     for color in &mut constraint_graph.colors {
         for constraint in &mut color.contact_constraints {
-            let affected = requested_contacts.as_ref().is_none_or(|ids| {
-                ids.binary_search(&constraint.contact_id).is_ok()
-            });
+            let affected = requested_contacts.binary_search(&constraint.contact_id).is_ok();
             if !affected {
                 continue;
             }
@@ -1037,45 +981,42 @@ fn rebuild_requested_contact_constraints(
     contact_softness: Res<ContactSoftnessCoefficients>,
     mut re_solve_queue: ResMut<ContactReseolveQueue>,
 ) {
-    let request = re_solve_queue.take_for_rebuild();
-    if let Some(request) = request {
-        let requested_contacts = request.as_deref();
+    let Some(requested_contacts) = re_solve_queue.take_for_rebuild() else {
+        return;
+    };
 
-        // Solver-body indices are refreshed by entity identity after any
-        // fracture-driven body insertion/removal. Impulse rollback already
-        // happened before contact-status changes could prune the old constraints.
-        for color in &mut constraint_graph.colors {
-            for constraint in &mut color.contact_constraints {
-                constraint.body_index1 = constraint
-                    .body_entity1
-                    .and_then(|entity| bodies.get(entity).ok()?.index.copied())
-                    .unwrap_or(SolverBodyIndex::INVALID);
-                constraint.body_index2 = constraint
-                    .body_entity2
-                    .and_then(|entity| bodies.get(entity).ok()?.index.copied())
-                    .unwrap_or(SolverBodyIndex::INVALID);
-            }
+    // Solver-body indices are refreshed by entity identity after any
+    // fracture-driven body insertion/removal. Impulse rollback already
+    // happened before contact-status changes could prune the old constraints.
+    for color in &mut constraint_graph.colors {
+        for constraint in &mut color.contact_constraints {
+            constraint.body_index1 = constraint
+                .body_entity1
+                .and_then(|entity| bodies.get(entity).ok()?.index.copied())
+                .unwrap_or(SolverBodyIndex::INVALID);
+            constraint.body_index2 = constraint
+                .body_entity2
+                .and_then(|entity| bodies.get(entity).ok()?.index.copied())
+                .unwrap_or(SolverBodyIndex::INVALID);
         }
-
-        // New geometry starts without cached impulses. The replacement
-        // contact will receive its response from the actual solver below.
-        prepare_contact_constraints_internal(
-            contact_graph,
-            constraint_graph,
-            &mut diagnostics,
-            bodies,
-            &solver_bodies,
-            contact_softness,
-            requested_contacts,
-            false,
-        );
     }
 
+    // New geometry starts without cached impulses. The replacement contact
+    // receives its response from the actual solver below.
+    prepare_contact_constraints_internal(
+        contact_graph,
+        constraint_graph,
+        &mut diagnostics,
+        bodies,
+        &solver_bodies,
+        contact_softness,
+        Some(&requested_contacts),
+        false,
+    );
 }
 
-/// Re-solves the contact constraints after a breakage system has refreshed the
-/// affected manifolds. The work is bounded by the queue's pass limit and does
-/// not integrate positions a second time.
+/// Re-solves the rebuilt contact constraints once after a breakage system has
+/// refreshed the affected manifolds. Positions are not integrated a second time.
 #[allow(clippy::too_many_arguments)]
 fn re_solve_requested_contacts(
     mut solver_bodies: ResMut<SolverBodies>,
@@ -1091,16 +1032,13 @@ fn re_solve_requested_contacts(
     };
 
     let is_requested = |contact_id: ContactId| {
-        requested_contacts
-            .as_ref()
-            .is_none_or(|ids| ids.binary_search(&contact_id).is_ok())
+        requested_contacts.binary_search(&contact_id).is_ok()
     };
 
     let start = crate::utils::Instant::now();
 
-    // Do not warm-start the whole island again. Unchanged constraints have
-    // already applied their warm-start and solve impulses this substep; the
-    // rebuilt contacts were generated without cached impulses.
+    // Unchanged constraints already applied their impulses this substep.
+    // Re-solve only the rebuilt contacts, without warm starting them again.
     let access = solver_bodies.access();
     let max_overlap_solve_speed = solver_config.max_overlap_solve_speed * length_unit.0;
     let delta_secs = time.delta_secs();
@@ -1127,8 +1065,7 @@ fn re_solve_requested_contacts(
     }
 
     for color in constraint_graph
-    
-    .colors
+        .colors
         .iter_mut()
         .take(COLOR_OVERFLOW_INDEX)
         .filter(|color| !color.contact_constraints.is_empty())
@@ -1651,83 +1588,50 @@ mod contact_re_solve_tests {
     use super::*;
 
     #[test]
-    fn a_new_substep_discards_an_unconsumed_transaction() {
-        let mut queue = ContactReseolveQueue::default();
-        queue.request_contacts([ContactId(3), ContactId(8)]);
-        assert_eq!(
-            queue.contacts_for_rollback(),
-            Some(Some(vec![ContactId(3), ContactId(8)])),
-        );
-
-        queue.begin_substep();
-
-        assert!(!queue.has_prepared_re_solve());
-        assert_eq!(queue.contacts_for_rollback(), None);
-    }
-
-    #[test]
     fn rollback_and_re_solve_share_one_sorted_deduplicated_batch() {
         let mut queue = ContactReseolveQueue::default();
         queue.request_contacts([ContactId(9), ContactId(2), ContactId(9)]);
 
         let expected = vec![ContactId(2), ContactId(9)];
-        assert_eq!(queue.contacts_for_rollback(), Some(Some(expected.clone())));
-        assert_eq!(queue.take_for_rebuild(), Some(Some(expected.clone())));
-        assert_eq!(queue.take_prepared_contacts(), Some(Some(expected)));
+        assert_eq!(queue.contacts_for_rollback(), Some(expected.clone()));
+        assert_eq!(queue.take_for_rebuild(), Some(expected.clone()));
+        assert_eq!(queue.take_prepared_contacts(), Some(expected));
     }
 
     #[test]
-    fn full_graph_request_replaces_local_requests() {
-        let mut queue = ContactReseolveQueue::default();
-        queue.request_contacts([ContactId(9)]);
-        queue.request_all();
-
-        assert_eq!(queue.contacts_for_rollback(), Some(None));
-        assert_eq!(queue.take_for_rebuild(), Some(None));
-        assert_eq!(queue.take_prepared_contacts(), Some(None));
-    }
-
-    #[test]
-    fn contact_queue_overflow_falls_back_to_full_graph() {
-        let mut queue = ContactReseolveQueue::default();
-        queue.request_contacts((0..MAX_PENDING_CONTACT_REBUILDS).map(|id| ContactId(id as u32)));
-        queue.request_contacts([ContactId(MAX_PENDING_CONTACT_REBUILDS as u32)]);
-
-        assert_eq!(queue.contacts_for_rollback(), Some(None));
-        assert_eq!(queue.take_for_rebuild(), Some(None));
-        assert_eq!(queue.take_prepared_contacts(), Some(None));
-    }
-
-    #[test]
-    fn new_contacts_join_the_same_substep_batch() {
-        let mut queue = ContactReseolveQueue::default();
-        queue.request_contacts([ContactId(12), ContactId(18)]);
-        queue.request_contacts([ContactId(7), ContactId(12)]);
-
-        assert_eq!(
-            queue.contacts_for_rollback(),
-            Some(Some(vec![ContactId(7), ContactId(12), ContactId(18)])),
-        );
-    }
-
-    #[test]
-    fn contacts_added_after_rollback_are_sorted_before_rebuild() {
+    fn contacts_discovered_after_rollback_join_the_same_re_solve() {
         let mut queue = ContactReseolveQueue::default();
         queue.request_contacts([ContactId(12), ContactId(18)]);
 
         assert_eq!(
             queue.contacts_for_rollback(),
-            Some(Some(vec![ContactId(12), ContactId(18)])),
+            Some(vec![ContactId(12), ContactId(18)]),
         );
 
-        // The narrow phase can discover contacts after the rollback stage.
         queue.request_contacts([ContactId(30), ContactId(7), ContactId(12)]);
 
-        let expected = vec![ContactId(7), ContactId(12), ContactId(18), ContactId(30)];
-        assert_eq!(queue.take_for_rebuild(), Some(Some(expected.clone())));
-        assert_eq!(queue.take_prepared_contacts(), Some(Some(expected)));
+        let expected = vec![
+            ContactId(7),
+            ContactId(12),
+            ContactId(18),
+            ContactId(30),
+        ];
+        assert_eq!(queue.take_for_rebuild(), Some(expected.clone()));
+        assert_eq!(queue.take_prepared_contacts(), Some(expected));
     }
 
+    #[test]
+    fn consumed_transaction_leaves_no_pending_contacts() {
+        let mut queue = ContactReseolveQueue::default();
+        queue.request_contacts([ContactId(3), ContactId(8)]);
+        assert!(queue.has_pending_rebuild());
+        queue.contacts_for_rollback();
+        queue.take_for_rebuild();
+        queue.take_prepared_contacts();
+
+        assert!(!queue.has_pending_rebuild());
+        assert!(!queue.has_prepared_re_solve());
+    }
 }
 
 /// Inverts a summed inverse inertia on its non-zero axes, so a locked axis doesn't zero the whole inverse.
@@ -1752,6 +1656,8 @@ mod fracture_contact_lifecycle_tests {
         constraints.colors[0].contact_constraints.push(ContactConstraint {
             body_index1: SolverBodyIndex::INVALID,
             body_index2: SolverBodyIndex::INVALID,
+            body_entity1: None,
+            body_entity2: None,
             relative_dominance: 0,
             friction: 0.0,
             restitution: 0.0,
