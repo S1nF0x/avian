@@ -650,12 +650,6 @@ pub struct ContactReseolveQueue {
 }
 
 impl ContactReseolveQueue {
-    /// Requests one contact pair for same-substep rollback and re-solving.
-    #[inline]
-    pub fn request_contact(&mut self, contact_id: ContactId) {
-        self.request_contacts([contact_id]);
-    }
-
     /// Requests a batch of contact pairs. Overflow safely falls back to the
     /// full graph rather than dropping a topology transaction.
     pub fn request_contacts(
@@ -680,13 +674,14 @@ impl ContactReseolveQueue {
 
     /// Requests a full contact-graph rollback, rebuild, and re-solve.
     #[inline]
-    pub fn request_all(&mut self) {
+    fn request_all(&mut self) {
         self.pending.clear();
         self.pending_all = true;
     }
 
-    pub(crate) fn has_pending_rebuild(&self) -> bool {
-        self.pending_all || !self.pending.is_empty()
+    /// Whether a requested contact rebuild has been prepared for re-solving.
+    pub fn has_prepared_re_solve(&self) -> bool {
+        self.prepared_contacts.is_some()
     }
 
     /// Returns the exact constraints whose current-substep impulses must be
