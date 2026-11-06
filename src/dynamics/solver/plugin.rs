@@ -641,7 +641,7 @@ impl Default for SolverConfig {
 /// refreshed broad/narrow phase. Overflow falls back to rebuilding the full
 /// contact graph; a published fracture is never silently dropped.
 /// Maximum number of local contact IDs retained before rebuilding the full graph.
-pub const MAX_PENDING_CONTACT_REBUILDS: usize = 1024;
+const MAX_PENDING_CONTACT_REBUILDS: usize = 1024;
 
 #[derive(Resource, Debug, Default)]
 pub struct ContactReseolveQueue {
@@ -719,6 +719,15 @@ impl ContactReseolveQueue {
 
     fn take_prepared_contacts(&mut self) -> Option<Option<Vec<ContactId>>> {
         core::mem::take(&mut self.prepared_contacts)
+    }
+
+    /// Starts a fresh transaction for each solver substep.
+    ///
+    /// Requests are valid only for the substep in which the authoritative
+    /// topology was published. An interrupted transaction must never be
+    /// replayed against a later substep's contact graph.
+    pub(crate) fn begin_substep(&mut self) {
+        self.clear_pending();
     }
 
     fn clear_pending(&mut self) {
@@ -1629,6 +1638,21 @@ mod contact_re_solve_tests {
     use super::*;
 
     #[test]
+    fn a_new_substep_discards_an_unconsumed_transaction() {
+        let mut queue = ContactReseolveQueue::default();
+        queue.request_contacts([ContactId(3), ContactId(8)]);
+        assert_eq!(
+            queue.contacts_for_rollback(),
+            Some(Some(vec![ContactId(3), ContactId(8)])),
+        );
+
+        queue.begin_substep();
+
+        assert!(!queue.has_prepared_re_solve());
+        assert_eq!(queue.contacts_for_rollback(), None);
+    }
+
+    #[test]
     fn rollback_and_re_solve_share_one_sorted_deduplicated_batch() {
         let mut queue = ContactReseolveQueue::default();
         queue.request_contacts([ContactId(9), ContactId(2), ContactId(9)]);
@@ -1642,7 +1666,7 @@ mod contact_re_solve_tests {
     #[test]
     fn full_graph_request_replaces_local_requests() {
         let mut queue = ContactReseolveQueue::default();
-        queue.request_contact(ContactId(9));
+        queue.request_contacts([ContactId(9)]);
         queue.request_all();
 
         assert_eq!(queue.contacts_for_rollback(), Some(None));
@@ -1654,7 +1678,7 @@ mod contact_re_solve_tests {
     fn contact_queue_overflow_falls_back_to_full_graph() {
         let mut queue = ContactReseolveQueue::default();
         queue.request_contacts((0..MAX_PENDING_CONTACT_REBUILDS).map(|id| ContactId(id as u32)));
-        queue.request_contact(ContactId(MAX_PENDING_CONTACT_REBUILDS as u32));
+        queue.request_contacts([ContactId(MAX_PENDING_CONTACT_REBUILDS as u32)]);
 
         assert_eq!(queue.contacts_for_rollback(), Some(None));
         assert_eq!(queue.take_for_rebuild(), Some(None));
