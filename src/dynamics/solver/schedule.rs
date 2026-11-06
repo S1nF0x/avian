@@ -211,10 +211,6 @@ pub enum ContactBreakageSystems {
     ReSolve,
 }
 
-/// A deprecated alias for [`SubstepSolverSystems`].
-#[deprecated(since = "0.4.0", note = "Renamed to `SubstepSolverSystems`")]
-pub type SubstepSolverSet = SubstepSolverSystems;
-
 /// The number of substeps used in the simulation.
 ///
 /// A higher number of substeps reduces the value of [`Time`],

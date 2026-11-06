@@ -110,7 +110,7 @@ pub mod prelude {
             *,
         },
         solver::{
-            ContactBreakEvent, ContactReseolveQueue, FractureCommitTicket,
+            ContactBreakEvent, ContactReseolveQueue,
             PhysicsLengthUnit, SolverConfig, SolverPlugin,
             SolverPlugins,
             islands::{

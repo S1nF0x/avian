@@ -620,13 +620,6 @@ pub struct SolverConfig {
     /// Default: `1`
     pub restitution_iterations: usize,
 
-    /// Maximum number of same-substep contact re-solves requested by
-    /// [`ContactReseolveQueue`] before the request is dropped for this
-    /// substep. This bounds work when a topology edit repeatedly invalidates
-    /// contacts.
-    ///
-    /// Default: `2`
-    pub contact_re_solve_max_passes: u8,
 }
 
 impl Default for SolverConfig {
@@ -638,173 +631,33 @@ impl Default for SolverConfig {
             warm_start_coefficient: 1.0,
             restitution_threshold: 1.0,
             restitution_iterations: 1,
-            contact_re_solve_max_passes: 2,
         }
     }
 }
 
-/// One generation-tagged authorization to make a fracture contact observe
-/// newly published collider geometry. Staging a ticket NEVER invalidates
-/// the load-bearing manifold. A stale ticket from an earlier substep cannot
-/// acknowledge a newer contact with a reused ContactId.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FractureCommitTicket {
-    contact_id: ContactId,
-    generation: u64,
-}
-
-impl FractureCommitTicket {
-    /// The contact pair for which a fracture publication was staged.
-    pub const fn contact_id(self) -> ContactId {
-        self.contact_id
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FracturePublication {
-    Awaiting,
-    Published,
-    Rejected,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct StagedFractureContact {
-    ticket: FractureCommitTicket,
-    publication: FracturePublication,
-}
-
-/// A request to rebuild one or more contact constraints during the current
-/// substep.
+/// Contact constraints invalidated by an authoritative topology change.
 ///
-/// The request is intentionally separate from the contact graph: an owning
-/// voxel system can edit its authoritative geometry, refresh the affected
-/// manifolds, and then request only the contact IDs whose constraints became
-/// stale. Requests are consumed by the [`ContactBreakageSystems::ReSolve`]
-/// set and are bounded by [`SolverConfig::contact_re_solve_max_passes`].
+/// Requests are collected before AABB refresh and consumed once after the
+/// refreshed broad/narrow phase. Overflow falls back to rebuilding the full
+/// contact graph; a published fracture is never silently dropped.
 const MAX_PENDING_CONTACT_REBUILDS: usize = 1024;
 
 #[derive(Resource, Debug, Default)]
 pub struct ContactReseolveQueue {
     pending: Vec<ContactId>,
     pending_all: bool,
-    passes_this_substep: u8,
     prepared_contacts: Option<Option<Vec<ContactId>>>,
-    dropped_this_substep: bool,
-    /// A fracture is provisional until the owner has applied its exact
-    /// volume edit AND published the corresponding collider. Unknown or
-    /// rejected tickets are rebuilt against the original load-bearing
-    /// manifold, never marked as published by the solver.
-    staged_fractures: Vec<StagedFractureContact>,
-    next_fracture_generation: u64,
-    unconfirmed_fractures_this_step: u32,
 }
 
 impl ContactReseolveQueue {
-    /// Stage a potential fracture from a solver-confirmed yield event.
-    /// No new contact state is visible from this call alone.
-    ///
-    /// The owner must call `acknowledge_fracture_publication` after the
-    /// exact collider swap and narrow-phase refresh, or
-    /// `reject_fracture_publication` if validation/publication fails.
-    /// Unacknowledged tickets are conservatively rejected at the substep's
-    /// re-solve barrier.
-    pub fn stage_fracture_contact(&mut self, contact_id: ContactId) -> FractureCommitTicket {
-        if let Some(previous) = self.staged_fractures.iter()
-            .find(|entry| entry.ticket.contact_id == contact_id)
-        {
-            return previous.ticket;
-        }
-        self.next_fracture_generation =
-            self.next_fracture_generation.wrapping_add(1).max(1);
-        let ticket = FractureCommitTicket {
-            contact_id,
-            generation: self.next_fracture_generation,
-        };
-        self.staged_fractures.push(StagedFractureContact {
-            ticket,
-            publication: FracturePublication::Awaiting,
-        });
-        ticket
-    }
-
-    /// Acknowledge only after the authoritative resident material cut,
-    /// collider publication, and narrow-phase contact refresh all succeeded.
-    /// The caller (not Avian) owns that geometry proof. Returns false for a
-    /// stale ticket, an already rejected fracture or duplicate acknowledgement.
-    pub fn acknowledge_fracture_publication(
-        &mut self,
-        ticket: FractureCommitTicket,
-    ) -> bool {
-        let Some(entry) = self.staged_fractures.iter_mut()
-            .find(|entry| entry.ticket == ticket)
-        else { return false };
-        if entry.publication != FracturePublication::Awaiting {
-            return false;
-        }
-        entry.publication = FracturePublication::Published;
-        self.request_contact(ticket.contact_id);
-        true
-    }
-
-    /// Reject a fracture whose authoritative material edit or collider
-    /// publication was deferred/failed. The solver will rebuild its still
-    /// present contact at ordinary load-bearing capacity and re-solve.
-    /// This does not falsely claim that earlier provisional impulses were
-    /// rolled back; doing that would require replaying the entire substep.
-    pub fn reject_fracture_publication(
-        &mut self,
-        ticket: FractureCommitTicket,
-    ) -> bool {
-        let Some(entry) = self.staged_fractures.iter_mut()
-            .find(|entry| entry.ticket == ticket)
-        else { return false };
-        if entry.publication != FracturePublication::Awaiting {
-            return false;
-        }
-        entry.publication = FracturePublication::Rejected;
-        self.request_contact(ticket.contact_id);
-        true
-    }
-
-    /// End the publication barrier before any constraints are rebuilt.
-    /// Unresolved tickets fall back to their intact contact. All variants
-    /// request the same bounded re-solve; ONLY a successful published
-    /// ticket is allowed to use a refreshed narrow-phase manifold.
-    fn seal_fracture_barrier(&mut self) {
-        let mut pending = core::mem::take(&mut self.staged_fractures);
-        for entry in &mut pending {
-            if entry.publication == FracturePublication::Awaiting {
-                entry.publication = FracturePublication::Rejected;
-                self.unconfirmed_fractures_this_step =
-                    self.unconfirmed_fractures_this_step.saturating_add(1);
-            }
-            self.request_contact(entry.ticket.contact_id);
-        }
-    }
-
-    fn take_unconfirmed_fractures(&mut self) -> u32 {
-        core::mem::take(&mut self.unconfirmed_fractures_this_step)
-    }
-
-    /// Requests a bounded re-solve for one contact pair.
+    /// Requests one contact pair for same-substep rollback and re-solving.
     #[inline]
     pub fn request_contact(&mut self, contact_id: ContactId) {
-        if !self.pending_all && !self.pending.contains(&contact_id) {
-            if self.pending.len() >= MAX_PENDING_CONTACT_REBUILDS {
-                // Preserve the intact manifold and let the owning gameplay
-                // system retry on the next substep. A contact rebuild is a
-                // bounded optimization; it must never become an unbounded
-                // allocation path under a pathological contact graph.
-                self.dropped_this_substep = true;
-                return;
-            }
-            self.pending.push(contact_id);
-        }
+        self.request_contacts([contact_id]);
     }
 
-    /// Requests a bounded batch of contact rebuilds. If the batch would exceed
-    /// the local queue capacity, it safely falls back to a full graph rebuild
-    /// rather than silently dropping contacts from a topology transaction.
+    /// Requests a batch of contact pairs. Overflow safely falls back to the
+    /// full graph rather than dropping a topology transaction.
     pub fn request_contacts(
         &mut self,
         contact_ids: impl IntoIterator<Item = ContactId>,
@@ -812,6 +665,7 @@ impl ContactReseolveQueue {
         if self.pending_all {
             return;
         }
+
         for contact_id in contact_ids {
             if self.pending.contains(&contact_id) {
                 continue;
@@ -824,44 +678,20 @@ impl ContactReseolveQueue {
         }
     }
 
-    /// Requests a bounded re-solve for every active contact constraint.
+    /// Requests a full contact-graph rollback, rebuild, and re-solve.
     #[inline]
     pub fn request_all(&mut self) {
         self.pending.clear();
         self.pending_all = true;
     }
 
-    /// Returns the number of contact IDs waiting for a re-solve.
-    #[inline]
-    pub fn pending_contact_count(&self) -> usize {
-        self.pending.len()
-    }
-
-    /// Returns whether a full contact rebuild was requested.
-    #[inline]
-    pub fn is_full_rebuild_requested(&self) -> bool {
-        self.pending_all
-    }
-
-    /// Returns whether contact constraints have been rebuilt and are waiting
-    /// for an application preparation hook before the bounded re-solve.
-    #[inline]
-    pub fn has_prepared_re_solve(&self) -> bool {
-        self.prepared_contacts.is_some()
-    }
-
-    /// Returns whether a same-substep topology refresh or contact re-solve is pending.
     pub(crate) fn has_pending_rebuild(&self) -> bool {
-        self.pending_all || !self.pending.is_empty() || !self.staged_fractures.is_empty()
+        self.pending_all || !self.pending.is_empty()
     }
 
-    /// Seals fracture tickets and returns the contact IDs whose current-substep impulses
-    /// must be reversed before contact-status changes can prune their constraints.
-    ///
-    /// The request is not consumed here; the same IDs are retained for constraint rebuilding
-    /// and the bounded re-solve later in the substep.
+    /// Returns the exact constraints whose current-substep impulses must be
+    /// reversed before old contact constraints are pruned.
     pub(crate) fn contacts_for_rollback(&mut self) -> Option<Option<Vec<ContactId>>> {
-        self.seal_fracture_barrier();
         if self.pending_all {
             Some(None)
         } else if self.pending.is_empty() {
@@ -872,37 +702,15 @@ impl ContactReseolveQueue {
         }
     }
 
-    pub(crate) fn begin_substep(&mut self) {
-        // The previous substep must not leak contact authorizations. The
-        // re-solve barrier normally consumes all staged entries, but an
-        // interrupted custom schedule cannot reuse their generations.
-        self.staged_fractures.clear();
-        self.passes_this_substep = 0;
-        self.prepared_contacts = None;
-        self.dropped_this_substep = false;
-        self.unconfirmed_fractures_this_step = 0;
-    }
-
-    fn take_for_rebuild(&mut self, max_passes: u8) -> Option<Option<Vec<ContactId>>> {
-        self.seal_fracture_barrier();
+    fn take_for_rebuild(&mut self) -> Option<Option<Vec<ContactId>>> {
         if !self.pending_all && self.pending.is_empty() {
             return None;
         }
 
-        let max_passes = max_passes.max(1);
-        if self.passes_this_substep >= max_passes {
-            self.pending.clear();
-            self.pending_all = false;
-            self.dropped_this_substep = true;
-            return None;
-        }
-
-        self.passes_this_substep += 1;
         let requested_contacts = if self.pending_all {
             self.pending_all = false;
             None
         } else {
-            self.pending.sort_unstable();
             Some(core::mem::take(&mut self.pending))
         };
         self.prepared_contacts = Some(requested_contacts.clone());
@@ -917,20 +725,14 @@ impl ContactReseolveQueue {
         self.pending.clear();
         self.pending_all = false;
         self.prepared_contacts = None;
-        self.staged_fractures.clear();
-    }
-
-    fn take_dropped(&mut self) -> bool {
-        core::mem::take(&mut self.dropped_this_substep)
     }
 }
 
 /// A material contact whose configured normal impulse capacity was exceeded.
 ///
-/// The event is emitted after the relaxation pass. A breakage system should
-/// update the authoritative material/topology, refresh the affected contact
-/// manifolds, and call [`ContactReseolveQueue::request_contact`] before the
-/// [`ContactBreakageSystems::ReSolve`] set runs.
+/// The event is emitted after the relaxation pass. The material owner updates
+/// authoritative geometry, queues affected contacts before AABB refresh, and
+/// lets the standard broad/narrow phase discover replacement manifolds.
 #[derive(Message, Clone, Copy, Debug, PartialEq)]
 pub struct ContactBreakEvent {
     /// The stable contact pair identifier.
@@ -1210,10 +1012,9 @@ fn rebuild_requested_contact_constraints(
     mut solver_bodies: ResMut<SolverBodies>,
     narrow_phase_config: Res<NarrowPhaseConfig>,
     contact_softness: Res<ContactSoftnessCoefficients>,
-    solver_config: Res<SolverConfig>,
     mut re_solve_queue: ResMut<ContactReseolveQueue>,
 ) {
-    let request = re_solve_queue.take_for_rebuild(solver_config.contact_re_solve_max_passes);
+    let request = re_solve_queue.take_for_rebuild();
     if let Some(request) = request {
         let requested_contacts = request.as_deref();
 
@@ -1248,11 +1049,6 @@ fn rebuild_requested_contact_constraints(
         );
     }
 
-    diagnostics.contact_fracture_unconfirmed +=
-        re_solve_queue.take_unconfirmed_fractures();
-    if re_solve_queue.take_dropped() {
-        diagnostics.contact_re_solve_dropped += 1;
-    }
 }
 
 /// Re-solves the contact constraints after a breakage system has refreshed the
@@ -1833,105 +1629,48 @@ mod contact_re_solve_tests {
     use super::*;
 
     #[test]
-    fn unconfirmed_fracture_is_automatically_restored_for_same_substep_resolve() {
+    fn rollback_and_re_solve_share_one_sorted_deduplicated_batch() {
         let mut queue = ContactReseolveQueue::default();
-        queue.begin_substep();
-        let ticket = queue.stage_fracture_contact(ContactId(17));
-        assert_eq!(ticket.contact_id(), ContactId(17));
-        assert_eq!(queue.pending_contact_count(), 0);
-        let rebuild = queue.take_for_rebuild(2).unwrap().unwrap();
-        assert_eq!(rebuild, vec![ContactId(17)]);
-        assert_eq!(queue.take_unconfirmed_fractures(), 1);
-        assert!(!queue.acknowledge_fracture_publication(ticket));
-        assert!(!queue.reject_fracture_publication(ticket));
+        queue.request_contacts([ContactId(9), ContactId(2), ContactId(9)]);
+
+        let expected = vec![ContactId(2), ContactId(9)];
+        assert_eq!(queue.contacts_for_rollback(), Some(Some(expected.clone())));
+        assert_eq!(queue.take_for_rebuild(), Some(Some(expected.clone())));
+        assert_eq!(queue.take_prepared_contacts(), Some(Some(expected)));
     }
 
     #[test]
-    fn a_published_fracture_is_admitted_exactly_once() {
+    fn full_graph_request_replaces_local_requests() {
         let mut queue = ContactReseolveQueue::default();
-        queue.begin_substep();
-        let ticket = queue.stage_fracture_contact(ContactId(9));
-        assert_eq!(queue.stage_fracture_contact(ContactId(9)), ticket);
-        assert!(queue.acknowledge_fracture_publication(ticket));
-        assert!(!queue.acknowledge_fracture_publication(ticket));
-        assert!(!queue.reject_fracture_publication(ticket));
-        assert_eq!(queue.take_for_rebuild(1).unwrap().unwrap(), vec![ContactId(9)]);
-        assert_eq!(queue.take_unconfirmed_fractures(), 0);
-    }
-
-    #[test]
-    fn rejected_or_old_ticket_cannot_authorize_a_reused_contact_id() {
-        let mut queue = ContactReseolveQueue::default();
-        queue.begin_substep();
-        let ticket = queue.stage_fracture_contact(ContactId(23));
-        assert!(queue.reject_fracture_publication(ticket));
-        assert!(!queue.acknowledge_fracture_publication(ticket));
-        assert_eq!(queue.take_for_rebuild(2).unwrap().unwrap(), vec![ContactId(23)]);
-        queue.begin_substep();
-        let new_ticket = queue.stage_fracture_contact(ContactId(23));
-        assert_ne!(ticket, new_ticket);
-        assert!(!queue.acknowledge_fracture_publication(ticket));
-        assert!(queue.acknowledge_fracture_publication(new_ticket));
-        assert_eq!(queue.take_for_rebuild(2).unwrap().unwrap(), vec![ContactId(23)]);
-    }
-
-    #[test]
-    fn rollback_and_re_solve_share_the_same_sorted_contact_set() {
-        let mut queue = ContactReseolveQueue::default();
-        queue.begin_substep();
         queue.request_contact(ContactId(9));
-        queue.request_contact(ContactId(2));
-
-        assert_eq!(
-            queue.contacts_for_rollback(),
-            Some(Some(vec![ContactId(2), ContactId(9)])),
-        );
-        assert_eq!(
-            queue.take_for_rebuild(2),
-            Some(Some(vec![ContactId(2), ContactId(9)])),
-        );
-        assert_eq!(
-            queue.take_prepared_contacts(),
-            Some(Some(vec![ContactId(2), ContactId(9)])),
-        );
-        assert!(!queue.has_prepared_re_solve());
-    }
-
-    #[test]
-    fn full_rebuild_rolls_back_and_re_solves_the_whole_contact_graph() {
-        let mut queue = ContactReseolveQueue::default();
-        queue.begin_substep();
         queue.request_all();
 
         assert_eq!(queue.contacts_for_rollback(), Some(None));
-        assert_eq!(queue.take_for_rebuild(1), Some(None));
+        assert_eq!(queue.take_for_rebuild(), Some(None));
         assert_eq!(queue.take_prepared_contacts(), Some(None));
     }
 
     #[test]
-    fn bulk_fracture_contact_requests_fall_back_to_full_graph() {
+    fn contact_queue_overflow_falls_back_to_full_graph() {
         let mut queue = ContactReseolveQueue::default();
-        queue.begin_substep();
         queue.request_contacts((0..MAX_PENDING_CONTACT_REBUILDS).map(|id| ContactId(id as u32)));
-        assert_eq!(queue.pending_contact_count(), MAX_PENDING_CONTACT_REBUILDS);
+        queue.request_contact(ContactId(MAX_PENDING_CONTACT_REBUILDS as u32));
 
-        queue.request_contacts([ContactId(MAX_PENDING_CONTACT_REBUILDS as u32)]);
-        assert_eq!(queue.pending_contact_count(), 0);
         assert_eq!(queue.contacts_for_rollback(), Some(None));
-        assert_eq!(queue.take_for_rebuild(1), Some(None));
+        assert_eq!(queue.take_for_rebuild(), Some(None));
         assert_eq!(queue.take_prepared_contacts(), Some(None));
     }
 
     #[test]
-    fn contact_re_solve_requests_are_bounded_per_substep() {
+    fn new_contacts_join_the_same_substep_batch() {
         let mut queue = ContactReseolveQueue::default();
-        queue.begin_substep();
-        queue.request_contact(ContactId(7));
-        assert!(queue.take_for_rebuild(1).is_some());
+        queue.request_contacts([ContactId(12), ContactId(18)]);
+        queue.request_contacts([ContactId(7), ContactId(12)]);
 
-        queue.request_contact(ContactId(7));
-        assert!(queue.take_for_rebuild(1).is_none());
-        assert!(queue.take_dropped());
+        assert_eq!(
+            queue.contacts_for_rollback(),
+            Some(Some(vec![ContactId(7), ContactId(12), ContactId(18)])),
+        );
     }
 }
 
