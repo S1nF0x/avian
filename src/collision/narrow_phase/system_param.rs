@@ -244,6 +244,14 @@ impl<C: AnyCollider> NarrowPhase<'_, '_, C> {
             return false;
         }
 
+        // Geometry can change without either collider moving or its AABB changing,
+        // as with an interior voxel cut. Contact recycling only compares relative
+        // poses, so it would otherwise reuse the pre-edit manifold and preserve
+        // contacts inside the newly opened topology.
+        if let Some((_, pair)) = self.contact_graph.get_mut_by_id(contact_id) {
+            pair.recycling_cache = None;
+        }
+
         self.update_contacts::<H>(Some(contact_id), delta_secs, hooks, context, diagnostics, commands);
         self.process_contact_status_changes(Some(contact_id), collision_started_writer, collision_ended_writer);
         self.contact_graph.get_by_id(contact_id).is_some()
