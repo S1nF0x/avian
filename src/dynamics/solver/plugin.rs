@@ -70,7 +70,7 @@ use core::cmp::Ordering;
 ///     3. [Solve constraints with bias](SubstepSolverSystems::SolveConstraints)
 ///     4. [Solve constraints without bias to relax velocities](SubstepSolverSystems::Relax)
 ///     5. Detect material failure, publish topology, refresh new contacts, roll back replaced
-///        contact impulses, and perform a bounded local re-solve.
+///        contact impulses, and perform one local re-solve.
 ///     6. Apply velocity-based constraint damping and integrate positions.
 /// 5. [Apply restitution](SolverSystems::Restitution)
 /// 6. [Write back solver body data to rigid bodies](SolverSystems::Finalize)
@@ -680,6 +680,11 @@ impl ContactReseolveQueue {
 
     fn take_prepared_contacts(&mut self) -> Option<Vec<ContactId>> {
         core::mem::take(&mut self.prepared_contacts)
+    }
+
+    /// Discards any unconsumed transaction before the next solver substep.
+    pub(crate) fn begin_substep(&mut self) {
+        self.clear_pending();
     }
 
     fn clear_pending(&mut self) {
@@ -1586,6 +1591,21 @@ pub fn joint_damping<T: Component + EntityConstraint<2>>(
 #[cfg(test)]
 mod contact_re_solve_tests {
     use super::*;
+
+    #[test]
+    fn a_new_substep_discards_an_unconsumed_transaction() {
+        let mut queue = ContactReseolveQueue::default();
+        queue.request_contacts([ContactId(3), ContactId(8)]);
+        assert_eq!(
+            queue.contacts_for_rollback(),
+            Some(vec![ContactId(3), ContactId(8)]),
+        );
+
+        queue.begin_substep();
+
+        assert!(!queue.has_pending_rebuild());
+        assert!(!queue.has_prepared_re_solve());
+    }
 
     #[test]
     fn rollback_and_re_solve_share_one_sorted_deduplicated_batch() {
