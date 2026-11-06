@@ -640,7 +640,8 @@ impl Default for SolverConfig {
 /// Requests are collected before AABB refresh and consumed once after the
 /// refreshed broad/narrow phase. Overflow falls back to rebuilding the full
 /// contact graph; a published fracture is never silently dropped.
-const MAX_PENDING_CONTACT_REBUILDS: usize = 1024;
+/// Maximum number of local contact IDs retained before rebuilding the full graph.
+pub const MAX_PENDING_CONTACT_REBUILDS: usize = 1024;
 
 #[derive(Resource, Debug, Default)]
 pub struct ContactReseolveQueue {
