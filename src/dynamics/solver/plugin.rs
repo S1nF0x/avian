@@ -1060,27 +1060,18 @@ fn re_solve_requested_contacts(
     // time turns that representation overlap into an artificial impact.
     // Re-solve only physical velocity constraints; do not apply a second
     // positional-correction pass within the same substep.
-    for constraint in constraint_graph.colors[COLOR_OVERFLOW_INDEX]
-        .contact_constraints
-        .iter_mut()
-    {
-        if is_requested(constraint.contact_id) {
-            solve_contacts_internal::<false>(
-                &access,
-                constraint,
-                max_overlap_solve_speed,
-                delta_secs,
-            );
-        }
-    }
-
-    for color in constraint_graph
-        .colors
-        .iter_mut()
-        .take(COLOR_OVERFLOW_INDEX)
-        .filter(|color| !color.contact_constraints.is_empty())
-    {
-        crate::utils::par_for_each(&mut color.contact_constraints, 64, |_i, constraint| {
+    //
+    // A topology edit can replace one old manifold with several new manifolds
+    // sharing the same impactor. One sequential pass is not enough to converge
+    // their coupled impulses: later manifolds can change the velocity seen by
+    // earlier ones and leave a spurious rebound. Iterate this affected island
+    // only; ordinary contacts retain the normal substepped solver cost.
+    const LOCAL_RE_SOLVE_ITERATIONS: usize = 4;
+    for _ in 0..LOCAL_RE_SOLVE_ITERATIONS {
+        for constraint in constraint_graph.colors[COLOR_OVERFLOW_INDEX]
+            .contact_constraints
+            .iter_mut()
+        {
             if is_requested(constraint.contact_id) {
                 solve_contacts_internal::<false>(
                     &access,
@@ -1089,7 +1080,25 @@ fn re_solve_requested_contacts(
                     delta_secs,
                 );
             }
-        });
+        }
+
+        for color in constraint_graph
+            .colors
+            .iter_mut()
+            .take(COLOR_OVERFLOW_INDEX)
+            .filter(|color| !color.contact_constraints.is_empty())
+        {
+            crate::utils::par_for_each(&mut color.contact_constraints, 64, |_i, constraint| {
+                if is_requested(constraint.contact_id) {
+                    solve_contacts_internal::<false>(
+                        &access,
+                        constraint,
+                        max_overlap_solve_speed,
+                        delta_secs,
+                    );
+                }
+            });
+        }
     }
 
     diagnostics.contact_re_solve_count += 1;
