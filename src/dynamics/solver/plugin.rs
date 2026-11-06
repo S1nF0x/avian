@@ -685,6 +685,11 @@ impl ContactReseolveQueue {
         self.prepared_contacts.is_some()
     }
 
+    /// Whether topology publication requires the standard collider refresh pipeline.
+    pub(crate) fn has_pending_rebuild(&self) -> bool {
+        self.pending_all || !self.pending.is_empty()
+    }
+
     /// Returns the exact constraints whose current-substep impulses must be
     /// reversed before old contact constraints are pruned.
     pub(crate) fn contacts_for_rollback(&mut self) -> Option<Option<Vec<ContactId>>> {
