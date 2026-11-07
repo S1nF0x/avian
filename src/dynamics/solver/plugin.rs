@@ -1062,14 +1062,10 @@ fn re_solve_requested_contacts(
     // positional-correction pass within the same substep.
     //
     // A topology edit can replace one old manifold with several new manifolds
-    // sharing the same impactor. One sequential pass is not enough to converge
-    // their coupled impulses: later manifolds can change the velocity seen by
-    // earlier ones and leave a spurious rebound. Iterate this affected island
-    // only; ordinary contacts retain the normal substepped solver cost.
-    // Topology replacement contacts are born at shared voxel poses. They are
-    // solved once after impulse rollback. Repeating the velocity projection on
-    // the same representation overlap manufactures a rebound impulse and can
-    // turn one fracture into a multi-frame oscillation.
+    // sharing the same impactor. These contacts are born at shared voxel poses
+    // and are already representation-overlapped. Repeating the velocity
+    // projection on that overlap manufactures a rebound impulse, so the
+    // affected island receives one sequential velocity pass after rollback.
     const LOCAL_RE_SOLVE_ITERATIONS: usize = 1;
     for _ in 0..LOCAL_RE_SOLVE_ITERATIONS {
         for constraint in constraint_graph.colors[COLOR_OVERFLOW_INDEX]
