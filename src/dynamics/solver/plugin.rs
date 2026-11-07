@@ -1066,7 +1066,11 @@ fn re_solve_requested_contacts(
     // their coupled impulses: later manifolds can change the velocity seen by
     // earlier ones and leave a spurious rebound. Iterate this affected island
     // only; ordinary contacts retain the normal substepped solver cost.
-    const LOCAL_RE_SOLVE_ITERATIONS: usize = 4;
+    // Topology replacement contacts are born at shared voxel poses. They are
+    // solved once after impulse rollback. Repeating the velocity projection on
+    // the same representation overlap manufactures a rebound impulse and can
+    // turn one fracture into a multi-frame oscillation.
+    const LOCAL_RE_SOLVE_ITERATIONS: usize = 1;
     for _ in 0..LOCAL_RE_SOLVE_ITERATIONS {
         for constraint in constraint_graph.colors[COLOR_OVERFLOW_INDEX]
             .contact_constraints
