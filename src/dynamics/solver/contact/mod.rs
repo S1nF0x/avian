@@ -1021,7 +1021,7 @@ fn solve_bounded_normal_block(
             let matrix_scale = (0..free_count)
                 .map(|i| augmented[i][i].abs())
                 .fold(0.0_f64, f64::max);
-            let pivot_floor = (matrix_scale * 1.0e-12).max(1.0e-14);
+            let pivot_floor = (matrix_scale * 1.0e-12).max(1.0e-30);
 
             for column in 0..free_count {
                 let pivot = (column..free_count)
