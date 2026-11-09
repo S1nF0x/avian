@@ -491,8 +491,12 @@ impl ContactConstraint {
             } else {
                 f64::INFINITY
             };
-            if upper[i] < lower[i] - 1.0e-8 {
-                return false;
+            if upper[i] < lower[i] {
+                if lower[i] - upper[i] <= 1.0e-8 {
+                    upper[i] = lower[i];
+                } else {
+                    return false;
+                }
             }
 
             biases[i] = f64::from(bias);
@@ -696,7 +700,148 @@ impl ContactConstraint {
         }
     }
 
-    /// Applies [restitution](`Restitution`) for the given bodies if the relative speed
+    fn apply_restitution_block(
+        &mut self,
+        body1: &mut SolverBody,
+        body2: &mut SolverBody,
+        inertia1: &SolverBodyInertia,
+        inertia2: &SolverBodyInertia,
+        threshold: f32,
+    ) -> bool {
+        const MAX_POINTS: usize = 4;
+        let count = self.points.len();
+        if !(2..=MAX_POINTS).contains(&count) {
+            return false;
+        }
+
+        let inv_mass_sum = inertia1.effective_inv_mass() + inertia2.effective_inv_mass();
+        let inv_angular_inertia1 = inertia1.effective_inv_angular_inertia();
+        let inv_angular_inertia2 = inertia2.effective_inv_angular_inertia();
+        let mut anchors1 = [Vector::ZERO; MAX_POINTS];
+        let mut anchors2 = [Vector::ZERO; MAX_POINTS];
+        let mut old_impulses = [0.0_f64; MAX_POINTS];
+        let mut lower = [0.0_f64; MAX_POINTS];
+        let mut upper = [0.0_f64; MAX_POINTS];
+        let mut linear = [0.0_f64; MAX_POINTS];
+        let mut eligible = [false; MAX_POINTS];
+        let mut matrix = [[0.0_f64; MAX_POINTS]; MAX_POINTS];
+
+        for i in 0..count {
+            let point = &self.points[i];
+            anchors1[i] = point.anchor1;
+            anchors2[i] = point.anchor2;
+            let old = point.normal_part.impulse;
+            let capacity = point.normal_part.max_impulse;
+            if !old.is_finite()
+                || old < 0.0
+                || capacity.is_nan()
+                || capacity < 0.0
+            {
+                return false;
+            }
+            old_impulses[i] = f64::from(old);
+
+            if point.normal_speed > -threshold || point.normal_part.total_impulse == 0.0 {
+                lower[i] = 0.0;
+                upper[i] = 0.0;
+                continue;
+            }
+
+            eligible[i] = true;
+            let relative_velocity =
+                body2.velocity_at_point(point.anchor2) - body1.velocity_at_point(point.anchor1);
+            linear[i] = f64::from(
+                relative_velocity.dot(self.normal) + self.restitution * point.normal_speed,
+            );
+            upper[i] = if capacity.is_finite() {
+                (f64::from(capacity) - old_impulses[i]).max(0.0)
+            } else {
+                f64::INFINITY
+            };
+        }
+
+        for i in 0..count {
+            for j in i..count {
+                let entry = normal_effective_mass_entry(
+                    anchors1[i],
+                    anchors2[i],
+                    anchors1[j],
+                    anchors2[j],
+                    self.normal,
+                    inv_mass_sum,
+                    &inv_angular_inertia1,
+                    &inv_angular_inertia2,
+                );
+                if !entry.is_finite() {
+                    return false;
+                }
+                matrix[i][j] = entry;
+                matrix[j][i] = entry;
+            }
+        }
+
+        let Some(delta_impulses) =
+            solve_bounded_normal_block(count, &matrix, &linear, &lower, &upper)
+        else {
+            return false;
+        };
+
+        for i in 0..count {
+            if !eligible[i] {
+                continue;
+            }
+
+            let point = &mut self.points[i];
+            let requested_accumulated = old_impulses[i] + delta_impulses[i];
+            let gradient = linear[i]
+                + (0..count)
+                    .map(|j| matrix[i][j] * delta_impulses[j])
+                    .sum::<f64>();
+            let gradient_scale = 1.0
+                + linear[i].abs()
+                + (0..count)
+                    .map(|j| (matrix[i][j] * delta_impulses[j]).abs())
+                    .sum::<f64>();
+            let gradient_tolerance = 1.0e-7 * gradient_scale;
+            let capacity = point.normal_part.max_impulse;
+            let at_capacity = capacity.is_finite()
+                && requested_accumulated >= f64::from(capacity)
+                    - 1.0e-7 * (1.0 + f64::from(capacity.abs()));
+
+            let requested = if at_capacity && gradient < -gradient_tolerance {
+                let diagonal = matrix[i][i];
+                let excess = if diagonal > 1.0e-12 {
+                    (-gradient / diagonal).max(0.0)
+                } else {
+                    0.0
+                };
+                f64::from(capacity) + excess
+            } else {
+                requested_accumulated
+            };
+
+            let applied_delta = point.normal_part.clamp_accumulated_impulse(
+                requested.min(f64::from(f32::MAX)) as f32,
+            );
+            if at_capacity && gradient < -gradient_tolerance {
+                point.normal_part.capacity_exceeded = true;
+            }
+            point.normal_part.total_impulse += applied_delta;
+            point.substep_applied_normal_impulse += applied_delta;
+
+            let impulse = applied_delta * self.normal;
+            body1.linear_velocity -= impulse * inertia1.effective_inv_mass();
+            body1.angular_velocity -=
+                inv_angular_inertia1 * cross(point.anchor1, impulse);
+            body2.linear_velocity += impulse * inertia2.effective_inv_mass();
+            body2.angular_velocity +=
+                inv_angular_inertia2 * cross(point.anchor2, impulse);
+        }
+
+        true
+    }
+
+    /// Applies [restitution]([`Restitution`]) for the given bodies if the relative speed
     /// along the contact normal exceeds the given `threshold`.
     pub fn apply_restitution(
         &mut self,
@@ -706,47 +851,36 @@ impl ContactConstraint {
         inertia2: &SolverBodyInertia,
         threshold: f32,
     ) {
+        if self.apply_restitution_block(body1, body2, inertia1, inertia2, threshold) {
+            return;
+        }
+
         let inv_mass1 = inertia1.effective_inv_mass();
         let inv_mass2 = inertia2.effective_inv_mass();
         let inv_angular_inertia1 = inertia1.effective_inv_angular_inertia();
         let inv_angular_inertia2 = inertia2.effective_inv_angular_inertia();
 
         for point in self.points.iter_mut() {
-            // Skip restitution for speeds below the threshold.
-            // We also skip contacts that don't apply an impulse to account for speculative contacts.
             if point.normal_speed > -threshold || point.normal_part.total_impulse == 0.0 {
                 continue;
             }
 
-            // Fixed anchors
             let r1 = point.anchor1;
             let r2 = point.anchor2;
-
-            // Relative velocity at contact point
             let relative_velocity = body2.velocity_at_point(r2) - body1.velocity_at_point(r1);
             let normal_speed = relative_velocity.dot(self.normal);
-
-            // Compute the incremental normal impulse to account for restitution.
             let mut impulse = -point.normal_part.effective_mass
                 * (normal_speed + self.restitution * point.normal_speed);
 
-            // Restitution is a real solver impulse too. Apply exactly the
-            // same material capacity bound as the main velocity solve, so a
-            // broken pane cannot regain rigid-wall momentum in this pass.
             impulse = point.normal_part.clamp_accumulated_impulse(
                 point.normal_part.impulse + impulse,
             );
-
-            // Add the incremental impulse instead of the full impulse because this is not a substep.
             point.normal_part.total_impulse += impulse;
             point.substep_applied_normal_impulse += impulse;
 
-            // Apply the impulse.
             let impulse = impulse * self.normal;
-
             body1.linear_velocity -= impulse * inv_mass1;
             body1.angular_velocity -= inv_angular_inertia1 * cross(r1, impulse);
-
             body2.linear_velocity += impulse * inv_mass2;
             body2.angular_velocity += inv_angular_inertia2 * cross(r2, impulse);
         }
@@ -791,8 +925,8 @@ fn normal_effective_mass_entry(
         + inv_angular_inertia2 * r2_i_cross_n * r2_j_cross_n;
 
     #[cfg(feature = "3d")]
-    let angular = r1_i_cross_n.dot(*inv_angular_inertia1 * r1_j_cross_n)
-        + r2_i_cross_n.dot(*inv_angular_inertia2 * r2_j_cross_n);
+    let angular = r1_i_cross_n.dot(inv_angular_inertia1 * r1_j_cross_n)
+        + r2_i_cross_n.dot(inv_angular_inertia2 * r2_j_cross_n);
 
     f64::from(linear + angular)
 }
