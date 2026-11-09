@@ -975,7 +975,7 @@ fn solve_bounded_normal_block(
     }
 
     let mut best: Option<([f64; 4], f64)> = None;
-    let combinations = 4_usize.pow(count as u32);
+    let combinations = 3_usize.pow(count as u32);
 
     for mut encoded in 0..combinations {
         let mut state = [0_u8; 4];
@@ -985,8 +985,8 @@ fn solve_bounded_normal_block(
         let mut valid = true;
 
         for i in 0..count {
-            let current = (encoded % 4) as u8;
-            encoded /= 4;
+            let current = (encoded % 3) as u8;
+            encoded /= 3;
             state[i] = current;
 
             let width = upper[i] - lower[i];
@@ -999,11 +999,8 @@ fn solve_bounded_normal_block(
                     free[free_count] = i;
                     free_count += 1;
                 }
-                2 if upper[i].is_finite() && width > bound_tolerance => {
+                2 if upper[i].is_finite() => {
                     value[i] = upper[i];
-                }
-                3 if width.abs() <= bound_tolerance => {
-                    value[i] = lower[i];
                 }
                 _ => {
                     valid = false;
@@ -1115,12 +1112,16 @@ fn solve_bounded_normal_block(
             let bound_tolerance = 1.0e-7
                 * (1.0 + lower[i].abs() + if upper[i].is_finite() { upper[i].abs() } else { 0.0 });
 
-            let kkt_valid = match state[i] {
-                0 => gradients[i] >= -tolerance,
-                1 => gradients[i].abs() <= 10.0 * tolerance,
-                2 => gradients[i] <= tolerance,
-                3 => true,
-                _ => false,
+            let fixed = (upper[i] - lower[i]).abs() <= bound_tolerance;
+            let kkt_valid = if fixed {
+                true
+            } else {
+                match state[i] {
+                    0 => gradients[i] >= -tolerance,
+                    1 => gradients[i].abs() <= 10.0 * tolerance,
+                    2 => gradients[i] <= tolerance,
+                    _ => false,
+                }
             };
             let at_lower = (value[i] - lower[i]).abs() <= bound_tolerance;
             let at_upper = upper[i].is_finite()
