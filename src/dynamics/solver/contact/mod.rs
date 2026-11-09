@@ -406,6 +406,191 @@ impl ContactConstraint {
         }
     }
 
+    fn solve_normal_block<const USE_BIAS: bool>(
+        &mut self,
+        body1: &mut SolverBody,
+        body2: &mut SolverBody,
+        inertia1: &SolverBodyInertia,
+        inertia2: &SolverBodyInertia,
+        delta_secs: f32,
+        max_overlap_solve_speed: f32,
+    ) -> bool {
+        const MAX_POINTS: usize = 4;
+        let count = self.points.len();
+        if !(2..=MAX_POINTS).contains(&count) {
+            return false;
+        }
+
+        let inv_mass_sum = inertia1.effective_inv_mass() + inertia2.effective_inv_mass();
+        let inv_angular_inertia1 = inertia1.effective_inv_angular_inertia();
+        let inv_angular_inertia2 = inertia2.effective_inv_angular_inertia();
+        let safe_dt = if delta_secs.is_finite() && delta_secs > 1.0e-6 {
+            delta_secs
+        } else {
+            1.0e-6
+        };
+
+        let mut anchors1 = [Vector::ZERO; MAX_POINTS];
+        let mut anchors2 = [Vector::ZERO; MAX_POINTS];
+        let mut old_impulses = [0.0_f64; MAX_POINTS];
+        let mut lower = [0.0_f64; MAX_POINTS];
+        let mut upper = [0.0_f64; MAX_POINTS];
+        let mut normal_speeds = [0.0_f64; MAX_POINTS];
+        let mut biases = [0.0_f64; MAX_POINTS];
+        let mut mass_scales = [1.0_f64; MAX_POINTS];
+        let mut impulse_scales = [0.0_f64; MAX_POINTS];
+        let mut matrix = [[0.0_f64; MAX_POINTS]; MAX_POINTS];
+
+        for i in 0..count {
+            let point = &self.points[i];
+            let r1 = point.anchor1;
+            let r2 = point.anchor2;
+            anchors1[i] = r1;
+            anchors2[i] = r2;
+
+            let rotated_r1 = body1.delta_rotation * r1;
+            let rotated_r2 = body2.delta_rotation * r2;
+            let separation = (
+                body2.delta_position - body1.delta_position + rotated_r2 - rotated_r1
+            ).dot(self.normal) + point.initial_separation;
+
+            let relative_velocity = body2.velocity_at_point(r2) - body1.velocity_at_point(r1);
+            normal_speeds[i] = f64::from(relative_velocity.dot(self.normal));
+
+            let (mass_scale, impulse_scale, bias) = if separation > 0.0 {
+                (1.0, 0.0, separation / safe_dt)
+            } else if USE_BIAS {
+                let softness = point.normal_part.softness;
+                (
+                    softness.mass_scale,
+                    softness.impulse_scale,
+                    (softness.bias * separation).max(-max_overlap_solve_speed),
+                )
+            } else {
+                (1.0, 0.0, 0.0)
+            };
+
+            let old = point.normal_part.impulse;
+            let capacity = point.normal_part.max_impulse;
+            if !old.is_finite()
+                || old < 0.0
+                || !mass_scale.is_finite()
+                || mass_scale < 0.0
+                || !impulse_scale.is_finite()
+                || !bias.is_finite()
+                || capacity.is_nan()
+                || capacity < 0.0
+            {
+                return false;
+            }
+
+            old_impulses[i] = f64::from(old);
+            lower[i] = -old_impulses[i];
+            upper[i] = if capacity.is_finite() {
+                f64::from(capacity) - old_impulses[i]
+            } else {
+                f64::INFINITY
+            };
+            if upper[i] < lower[i] - 1.0e-8 {
+                return false;
+            }
+
+            biases[i] = f64::from(bias);
+            mass_scales[i] = f64::from(mass_scale);
+            impulse_scales[i] = f64::from(impulse_scale);
+        }
+
+        for i in 0..count {
+            for j in i..count {
+                let entry = normal_effective_mass_entry(
+                    anchors1[i],
+                    anchors2[i],
+                    anchors1[j],
+                    anchors2[j],
+                    self.normal,
+                    inv_mass_sum,
+                    &inv_angular_inertia1,
+                    &inv_angular_inertia2,
+                );
+                if !entry.is_finite() {
+                    return false;
+                }
+                matrix[i][j] = entry;
+                matrix[j][i] = entry;
+            }
+        }
+
+        let mut linear = [0.0_f64; MAX_POINTS];
+        for i in 0..count {
+            let coupled_old_impulse = (0..count)
+                .map(|j| matrix[i][j] * old_impulses[j])
+                .sum::<f64>();
+            linear[i] = mass_scales[i] * (normal_speeds[i] + biases[i])
+                + impulse_scales[i] * coupled_old_impulse;
+        }
+
+        let Some(delta_impulses) =
+            solve_bounded_normal_block(count, &matrix, &linear, &lower, &upper)
+        else {
+            return false;
+        };
+
+        // All point impulses are solved before any body velocity is changed.
+        // Applying the resulting deltas afterwards preserves the coupled
+        // solution instead of reintroducing point-order dependence.
+        for i in 0..count {
+            let point = &mut self.points[i];
+            let requested_accumulated = old_impulses[i] + delta_impulses[i];
+            let gradient = linear[i]
+                + (0..count)
+                    .map(|j| matrix[i][j] * delta_impulses[j])
+                    .sum::<f64>();
+            let gradient_scale = 1.0
+                + linear[i].abs()
+                + (0..count)
+                    .map(|j| (matrix[i][j] * delta_impulses[j]).abs())
+                    .sum::<f64>();
+            let gradient_tolerance = 1.0e-7 * gradient_scale;
+
+            let capacity = point.normal_part.max_impulse;
+            let at_capacity = capacity.is_finite()
+                && requested_accumulated >= f64::from(capacity)
+                    - 1.0e-7 * (1.0 + f64::from(capacity.abs()));
+
+            let requested = if at_capacity && gradient < -gradient_tolerance {
+                let diagonal = matrix[i][i];
+                let excess = if diagonal > 1.0e-12 {
+                    (-gradient / diagonal).max(0.0)
+                } else {
+                    0.0
+                };
+                f64::from(capacity) + excess
+            } else {
+                requested_accumulated
+            };
+
+            let requested_f32 = requested.min(f64::from(f32::MAX)) as f32;
+            let applied_delta = point
+                .normal_part
+                .clamp_accumulated_impulse(requested_f32);
+            if at_capacity && gradient < -gradient_tolerance {
+                point.normal_part.capacity_exceeded = true;
+            }
+            point.normal_part.total_impulse += applied_delta;
+            point.substep_applied_normal_impulse += applied_delta;
+
+            let impulse = applied_delta * self.normal;
+            let r1 = point.anchor1;
+            let r2 = point.anchor2;
+            body1.linear_velocity -= impulse * inertia1.effective_inv_mass();
+            body1.angular_velocity -= inv_angular_inertia1 * cross(r1, impulse);
+            body2.linear_velocity += impulse * inertia2.effective_inv_mass();
+            body2.angular_velocity += inv_angular_inertia2 * cross(r2, impulse);
+        }
+
+        true
+    }
+
     /// Solves the [`ContactConstraint`], applying an impulse to the given bodies.
     pub fn solve<const USE_BIAS: bool>(
         &mut self,
@@ -423,40 +608,43 @@ impl ContactConstraint {
 
         let delta_translation = body2.delta_position - body1.delta_position;
 
-        // Normal impulses
-        for point in self.points.iter_mut() {
-            let r1 = body1.delta_rotation * point.anchor1;
-            let r2 = body2.delta_rotation * point.anchor2;
+        // Solve the complete normal contact patch as one bounded system.
+        // A sequential point solve is retained only for unusually large or
+        // numerically degenerate manifolds.
+        if !self.solve_normal_block::<USE_BIAS>(
+            body1,
+            body2,
+            inertia1,
+            inertia2,
+            delta_secs,
+            max_overlap_solve_speed,
+        ) {
+            for point in self.points.iter_mut() {
+                let r1 = body1.delta_rotation * point.anchor1;
+                let r2 = body2.delta_rotation * point.anchor2;
 
-            // Compute current separation.
-            let delta_separation = delta_translation + (r2 - r1);
-            let separation = delta_separation.dot(self.normal) + point.initial_separation;
+                let delta_separation = delta_translation + (r2 - r1);
+                let separation = delta_separation.dot(self.normal) + point.initial_separation;
 
-            // Fixed anchors
-            let r1 = point.anchor1;
-            let r2 = point.anchor2;
+                let r1 = point.anchor1;
+                let r2 = point.anchor2;
+                let relative_velocity = body2.velocity_at_point(r2) - body1.velocity_at_point(r1);
+                let impulse_magnitude = point.normal_part.solve_impulse::<USE_BIAS>(
+                    separation,
+                    relative_velocity,
+                    self.normal,
+                    max_overlap_solve_speed,
+                    delta_secs,
+                );
 
-            // Relative velocity at contact
-            let relative_velocity = body2.velocity_at_point(r2) - body1.velocity_at_point(r1);
+                let impulse = impulse_magnitude * self.normal;
+                point.substep_applied_normal_impulse += impulse_magnitude;
 
-            // Compute the incremental impulse. The clamping and impulse accumulation is handled by the method.
-            let impulse_magnitude = point.normal_part.solve_impulse::<USE_BIAS>(
-                separation,
-                relative_velocity,
-                self.normal,
-                max_overlap_solve_speed,
-                delta_secs,
-            );
-
-            let impulse = impulse_magnitude * self.normal;
-            point.substep_applied_normal_impulse += impulse_magnitude;
-
-            // Apply the impulse.
-            body1.linear_velocity -= impulse * inv_mass1;
-            body1.angular_velocity -= inv_angular_inertia1 * cross(r1, impulse);
-
-            body2.linear_velocity += impulse * inv_mass2;
-            body2.angular_velocity += inv_angular_inertia2 * cross(r2, impulse);
+                body1.linear_velocity -= impulse * inv_mass1;
+                body1.angular_velocity -= inv_angular_inertia1 * cross(r1, impulse);
+                body2.linear_velocity += impulse * inv_mass2;
+                body2.angular_velocity += inv_angular_inertia2 * cross(r2, impulse);
+            }
         }
 
         // Friction impulses, only during the relaxation stage.
@@ -577,6 +765,259 @@ impl ContactConstraint {
             [self.tangent1, self.tangent1.cross(self.normal)]
         }
     }
+}
+
+
+/// Computes one entry of the coupled normal effective-mass matrix.
+#[inline]
+fn normal_effective_mass_entry(
+    r1_i: Vector,
+    r2_i: Vector,
+    r1_j: Vector,
+    r2_j: Vector,
+    normal: Vector,
+    inv_mass_sum: Vector,
+    inv_angular_inertia1: &SymmetricTensor,
+    inv_angular_inertia2: &SymmetricTensor,
+) -> f64 {
+    let linear = normal.dot(inv_mass_sum * normal);
+    let r1_i_cross_n = cross(r1_i, normal);
+    let r1_j_cross_n = cross(r1_j, normal);
+    let r2_i_cross_n = cross(r2_i, normal);
+    let r2_j_cross_n = cross(r2_j, normal);
+
+    #[cfg(feature = "2d")]
+    let angular = inv_angular_inertia1 * r1_i_cross_n * r1_j_cross_n
+        + inv_angular_inertia2 * r2_i_cross_n * r2_j_cross_n;
+
+    #[cfg(feature = "3d")]
+    let angular = r1_i_cross_n.dot(*inv_angular_inertia1 * r1_j_cross_n)
+        + r2_i_cross_n.dot(*inv_angular_inertia2 * r2_j_cross_n);
+
+    f64::from(linear + angular)
+}
+
+/// Solves a tiny convex quadratic program with box constraints. Active-set
+/// enumeration is exact for the usual two-to-four-point contact patch; a
+/// symmetric projected-gradient fallback handles rank-deficient manifolds.
+fn solve_bounded_normal_block(
+    count: usize,
+    matrix: &[[f64; 4]; 4],
+    linear: &[f64; 4],
+    lower: &[f64; 4],
+    upper: &[f64; 4],
+) -> Option<[f64; 4]> {
+    if count < 2 || count > 4 {
+        return None;
+    }
+
+    let mut best: Option<([f64; 4], f64)> = None;
+    let combinations = 4_usize.pow(count as u32);
+
+    for mut encoded in 0..combinations {
+        let mut state = [0_u8; 4];
+        let mut value = [0.0_f64; 4];
+        let mut free = [0_usize; 4];
+        let mut free_count = 0_usize;
+        let mut valid = true;
+
+        for i in 0..count {
+            let current = (encoded % 4) as u8;
+            encoded /= 4;
+            state[i] = current;
+
+            let width = upper[i] - lower[i];
+            let bound_tolerance = 1.0e-9
+                * (1.0 + lower[i].abs() + if upper[i].is_finite() { upper[i].abs() } else { 0.0 });
+
+            match current {
+                0 => value[i] = lower[i],
+                1 if width > bound_tolerance => {
+                    free[free_count] = i;
+                    free_count += 1;
+                }
+                2 if upper[i].is_finite() && width > bound_tolerance => {
+                    value[i] = upper[i];
+                }
+                3 if width.abs() <= bound_tolerance => {
+                    value[i] = lower[i];
+                }
+                _ => {
+                    valid = false;
+                    break;
+                }
+            }
+        }
+        if !valid {
+            continue;
+        }
+
+        if free_count > 0 {
+            let mut augmented = [[0.0_f64; 5]; 4];
+            for row in 0..free_count {
+                let i = free[row];
+                for column in 0..free_count {
+                    let j = free[column];
+                    augmented[row][column] = matrix[i][j];
+                }
+                let fixed_response = (0..count)
+                    .filter(|j| state[*j] != 1)
+                    .map(|j| matrix[i][j] * value[j])
+                    .sum::<f64>();
+                augmented[row][free_count] = -linear[i] - fixed_response;
+            }
+
+            let matrix_scale = (0..free_count)
+                .map(|i| augmented[i][i].abs())
+                .fold(0.0_f64, f64::max);
+            let pivot_floor = (matrix_scale * 1.0e-12).max(1.0e-14);
+
+            for column in 0..free_count {
+                let pivot = (column..free_count)
+                    .max_by(|a, b| {
+                        augmented[*a][column]
+                            .abs()
+                            .total_cmp(&augmented[*b][column].abs())
+                    })?;
+                if augmented[pivot][column].abs() <= pivot_floor {
+                    valid = false;
+                    break;
+                }
+                if pivot != column {
+                    augmented.swap(pivot, column);
+                }
+
+                let diagonal = augmented[column][column];
+                for j in column..=free_count {
+                    augmented[column][j] /= diagonal;
+                }
+                for row in 0..free_count {
+                    if row == column {
+                        continue;
+                    }
+                    let factor = augmented[row][column];
+                    for j in column..=free_count {
+                        augmented[row][j] -= factor * augmented[column][j];
+                    }
+                }
+            }
+            if !valid {
+                continue;
+            }
+
+            for row in 0..free_count {
+                value[free[row]] = augmented[row][free_count];
+            }
+        }
+
+        for i in 0..count {
+            let bound_tolerance = 1.0e-7
+                * (1.0 + lower[i].abs() + if upper[i].is_finite() { upper[i].abs() } else { 0.0 });
+            if value[i] < lower[i] - bound_tolerance
+                || value[i] > upper[i] + bound_tolerance
+                || !value[i].is_finite()
+            {
+                valid = false;
+                break;
+            }
+            value[i] = value[i].clamp(lower[i], upper[i]);
+        }
+        if !valid {
+            continue;
+        }
+
+        let mut objective = 0.0_f64;
+        for i in 0..count {
+            objective += linear[i] * value[i];
+            for j in 0..count {
+                objective += 0.5 * value[i] * matrix[i][j] * value[j];
+            }
+        }
+        if !objective.is_finite() {
+            continue;
+        }
+
+        let mut gradients = [0.0_f64; 4];
+        for i in 0..count {
+            gradients[i] = linear[i]
+                + (0..count)
+                    .map(|j| matrix[i][j] * value[j])
+                    .sum::<f64>();
+            let scale = 1.0
+                + linear[i].abs()
+                + (0..count)
+                    .map(|j| (matrix[i][j] * value[j]).abs())
+                    .sum::<f64>();
+            let tolerance = 2.0e-7 * scale;
+            let bound_tolerance = 1.0e-7
+                * (1.0 + lower[i].abs() + if upper[i].is_finite() { upper[i].abs() } else { 0.0 });
+
+            let kkt_valid = match state[i] {
+                0 => gradients[i] >= -tolerance,
+                1 => gradients[i].abs() <= 10.0 * tolerance,
+                2 => gradients[i] <= tolerance,
+                3 => true,
+                _ => false,
+            };
+            let at_lower = (value[i] - lower[i]).abs() <= bound_tolerance;
+            let at_upper = upper[i].is_finite()
+                && (value[i] - upper[i]).abs() <= bound_tolerance;
+            if !kkt_valid
+                || (state[i] == 0 && !at_lower)
+                || (state[i] == 2 && !at_upper)
+                || (state[i] == 1 && (at_lower || at_upper))
+            {
+                valid = false;
+                break;
+            }
+        }
+        if !valid {
+            continue;
+        }
+
+        if best.as_ref().is_none_or(|(_, best_objective)| objective < *best_objective) {
+            best = Some((value, objective));
+        }
+    }
+
+    if let Some((solution, _)) = best {
+        return Some(solution);
+    }
+
+    // Rank-deficient contact patches have a non-unique impulse distribution.
+    // Projected gradient uses the whole symmetric matrix at every iteration,
+    // avoiding an arbitrary contact-point ordering as the tie-break.
+    let row_sum = (0..count)
+        .map(|i| (0..count).map(|j| matrix[i][j].abs()).sum::<f64>())
+        .fold(0.0_f64, f64::max);
+    if !row_sum.is_finite() || row_sum <= 1.0e-14 {
+        return None;
+    }
+
+    let step = 0.95 / row_sum;
+    let mut value = [0.0_f64; 4];
+    for i in 0..count {
+        value[i] = 0.0_f64.clamp(lower[i], upper[i]);
+    }
+
+    for _ in 0..512 {
+        let mut next = value;
+        let mut maximum_change = 0.0_f64;
+        for i in 0..count {
+            let gradient = linear[i]
+                + (0..count)
+                    .map(|j| matrix[i][j] * value[j])
+                    .sum::<f64>();
+            next[i] = (value[i] - step * gradient).clamp(lower[i], upper[i]);
+            maximum_change = maximum_change.max((next[i] - value[i]).abs());
+        }
+        value = next;
+        if maximum_change <= 1.0e-10 {
+            break;
+        }
+    }
+
+    value[..count].iter().all(|value| value.is_finite()).then_some(value)
 }
 
 /// Computes `DIM - 1` tangent directions.
