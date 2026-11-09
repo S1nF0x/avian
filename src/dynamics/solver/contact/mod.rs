@@ -945,6 +945,23 @@ fn solve_bounded_normal_block(
         return None;
     }
 
+    let matrix_scale = (0..count)
+        .map(|i| matrix[i][i].abs())
+        .fold(0.0_f64, f64::max);
+    if !matrix_scale.is_finite() || matrix_scale <= 1.0e-14 {
+        return None;
+    }
+
+    // Normal impulses in a planar 3D patch have a one-dimensional nullspace:
+    // several point distributions can produce the same rigid-body wrench.
+    // A vanishingly small diagonal term selects the minimum-norm distribution
+    // instead of allowing manifold point order to choose one arbitrary corner.
+    let mut hessian = *matrix;
+    let regularizer = matrix_scale * 1.0e-10;
+    for i in 0..count {
+        hessian[i][i] += regularizer;
+    }
+
     let mut best: Option<([f64; 4], f64)> = None;
     let combinations = 4_usize.pow(count as u32);
 
@@ -992,11 +1009,11 @@ fn solve_bounded_normal_block(
                 let i = free[row];
                 for column in 0..free_count {
                     let j = free[column];
-                    augmented[row][column] = matrix[i][j];
+                    augmented[row][column] = hessian[i][j];
                 }
                 let fixed_response = (0..count)
                     .filter(|j| state[*j] != 1)
-                    .map(|j| matrix[i][j] * value[j])
+                    .map(|j| hessian[i][j] * value[j])
                     .sum::<f64>();
                 augmented[row][free_count] = -linear[i] - fixed_response;
             }
@@ -1064,7 +1081,7 @@ fn solve_bounded_normal_block(
         for i in 0..count {
             objective += linear[i] * value[i];
             for j in 0..count {
-                objective += 0.5 * value[i] * matrix[i][j] * value[j];
+                objective += 0.5 * value[i] * hessian[i][j] * value[j];
             }
         }
         if !objective.is_finite() {
@@ -1075,12 +1092,12 @@ fn solve_bounded_normal_block(
         for i in 0..count {
             gradients[i] = linear[i]
                 + (0..count)
-                    .map(|j| matrix[i][j] * value[j])
+                    .map(|j| hessian[i][j] * value[j])
                     .sum::<f64>();
             let scale = 1.0
                 + linear[i].abs()
                 + (0..count)
-                    .map(|j| (matrix[i][j] * value[j]).abs())
+                    .map(|j| (hessian[i][j] * value[j]).abs())
                     .sum::<f64>();
             let tolerance = 2.0e-7 * scale;
             let bound_tolerance = 1.0e-7
@@ -1122,7 +1139,7 @@ fn solve_bounded_normal_block(
     // Projected gradient uses the whole symmetric matrix at every iteration,
     // avoiding an arbitrary contact-point ordering as the tie-break.
     let row_sum = (0..count)
-        .map(|i| (0..count).map(|j| matrix[i][j].abs()).sum::<f64>())
+        .map(|i| (0..count).map(|j| hessian[i][j].abs()).sum::<f64>())
         .fold(0.0_f64, f64::max);
     if !row_sum.is_finite() || row_sum <= 1.0e-14 {
         return None;
@@ -1140,7 +1157,7 @@ fn solve_bounded_normal_block(
         for i in 0..count {
             let gradient = linear[i]
                 + (0..count)
-                    .map(|j| matrix[i][j] * value[j])
+                    .map(|j| hessian[i][j] * value[j])
                     .sum::<f64>();
             next[i] = (value[i] - step * gradient).clamp(lower[i], upper[i]);
             maximum_change = maximum_change.max((next[i] - value[i]).abs());
