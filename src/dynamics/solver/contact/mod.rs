@@ -781,7 +781,14 @@ impl ContactConstraint {
         }
 
         let Some(delta_impulses) =
-            solve_bounded_normal_block(count, &matrix, &linear, &lower, &upper)
+            solve_bounded_normal_block(
+                count,
+                &matrix,
+                &linear,
+                &lower,
+                &upper,
+                &old_impulses,
+            )
         else {
             return false;
         };
@@ -964,7 +971,7 @@ fn solve_bounded_normal_block(
         hessian[i][i] += regularizer;
         // Select the minimum-norm final accumulated impulse, not merely the
         // minimum change from a potentially asymmetric warm-start cache.
-        regularized_regularized_linear[i] += regularizer * reference_impulses[i];
+        regularized_linear[i] += regularizer * reference_impulses[i];
     }
 
     let mut best: Option<([f64; 4], f64)> = None;
