@@ -3,7 +3,6 @@ use bevy::reflect::Reflect;
 #[cfg(feature = "serialize")]
 use bevy::reflect::{ReflectDeserialize, ReflectSerialize};
 
-// TODO: Block solver for solving two contact points simultaneously
 // TODO: One-body constraint version
 /// The normal part of a [`ContactConstraintPoint`](super::ContactConstraintPoint).
 /// Aims to resolve overlap.
