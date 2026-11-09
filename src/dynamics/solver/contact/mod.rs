@@ -534,7 +534,7 @@ impl ContactConstraint {
         }
 
         let Some(delta_impulses) =
-            solve_bounded_normal_block(count, &matrix, &linear, &lower, &upper)
+            solve_bounded_normal_block(count, &matrix, &linear, &lower, &upper, &old_impulses)
         else {
             return false;
         };
@@ -940,6 +940,7 @@ fn solve_bounded_normal_block(
     linear: &[f64; 4],
     lower: &[f64; 4],
     upper: &[f64; 4],
+    reference_impulses: &[f64; 4],
 ) -> Option<[f64; 4]> {
     if count < 2 || count > 4 {
         return None;
@@ -958,8 +959,12 @@ fn solve_bounded_normal_block(
     // instead of allowing manifold point order to choose one arbitrary corner.
     let mut hessian = *matrix;
     let regularizer = matrix_scale * 1.0e-10;
+    let mut regularized_linear = *linear;
     for i in 0..count {
         hessian[i][i] += regularizer;
+        // Select the minimum-norm final accumulated impulse, not merely the
+        // minimum change from a potentially asymmetric warm-start cache.
+        regularized_regularized_linear[i] += regularizer * reference_impulses[i];
     }
 
     let mut best: Option<([f64; 4], f64)> = None;
@@ -1015,7 +1020,7 @@ fn solve_bounded_normal_block(
                     .filter(|j| state[*j] != 1)
                     .map(|j| hessian[i][j] * value[j])
                     .sum::<f64>();
-                augmented[row][free_count] = -linear[i] - fixed_response;
+                augmented[row][free_count] = -regularized_linear[i] - fixed_response;
             }
 
             let matrix_scale = (0..free_count)
@@ -1079,7 +1084,7 @@ fn solve_bounded_normal_block(
 
         let mut objective = 0.0_f64;
         for i in 0..count {
-            objective += linear[i] * value[i];
+            objective += regularized_linear[i] * value[i];
             for j in 0..count {
                 objective += 0.5 * value[i] * hessian[i][j] * value[j];
             }
@@ -1090,12 +1095,12 @@ fn solve_bounded_normal_block(
 
         let mut gradients = [0.0_f64; 4];
         for i in 0..count {
-            gradients[i] = linear[i]
+            gradients[i] = regularized_linear[i]
                 + (0..count)
                     .map(|j| hessian[i][j] * value[j])
                     .sum::<f64>();
             let scale = 1.0
-                + linear[i].abs()
+                + regularized_linear[i].abs()
                 + (0..count)
                     .map(|j| (hessian[i][j] * value[j]).abs())
                     .sum::<f64>();
@@ -1155,7 +1160,7 @@ fn solve_bounded_normal_block(
         let mut next = value;
         let mut maximum_change = 0.0_f64;
         for i in 0..count {
-            let gradient = linear[i]
+            let gradient = regularized_linear[i]
                 + (0..count)
                     .map(|j| hessian[i][j] * value[j])
                     .sum::<f64>();
