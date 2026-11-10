@@ -1811,7 +1811,8 @@ mod contact_re_solve_tests {
     fn multiple_material_owners_accumulate_fracture_work_for_one_contact() {
         let mut queue = ContactReseolveQueue::default();
         queue.request_impulse_retention(ContactId(5), 200_000.0, 200_000.0, 10.0, 100.0);
-        queue.request_impulse_retention(ContactId(5), 200_000.0, 200_000.0, 20.0, 400.0);
+        let returned_fraction =
+            queue.request_impulse_retention(ContactId(5), 200_000.0, 200_000.0, 20.0, 400.0);
 
         let expected = material_failure_impulse_fraction(
             200_000.0,
@@ -1819,6 +1820,7 @@ mod contact_re_solve_tests {
             30.0,
             400.0,
         );
+        assert_eq!(returned_fraction, expected);
         assert_eq!(queue.retained_impulse_fraction(ContactId(5)), Some(expected));
         assert!(queue.pending.contains(&ContactId(5)));
     }
