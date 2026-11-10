@@ -942,11 +942,37 @@ fn prepare_contact_constraints_internal(
         .sum::<usize>() as u32;
 }
 
-/// Reverses affected contact impulses before contact-status changes can
-/// remove their old constraints. A topology publication may despawn a body;
-/// Avian's removal observer swap-removes its solver body immediately. Resolve
-/// both indices by entity so a stale slot is never applied to the swapped body.
+/// Returns whether a refreshed pair has a replacement solver manifold for
+/// the same rigid-body pair as an old constraint. A contact ID can be retired
+/// and reused during topology refresh, so identity alone is not sufficient.
+fn has_replacement_solver_manifold(
+    pair: Option<&ContactPair>,
+    body_entity1: Option<Entity>,
+    body_entity2: Option<Entity>,
+) -> bool {
+    pair.is_some_and(|pair| {
+        pair.is_touching()
+            && pair.generates_constraints()
+            && pair.body1 == body_entity1
+            && pair.body2 == body_entity2
+            && pair.manifolds.iter().any(|manifold| !manifold.points.is_empty())
+    })
+}
+
+/// Reverses affected impulses only when refreshed geometry still has a
+/// replacement solver manifold for that same body pair.
+///
+/// If fracture removes the entire contact surface, the old impulse is already
+/// a real momentum exchange in this substep. Reversing it with no replacement
+/// constraint would erase the impact from both bodies. Such impulses remain
+/// committed; surviving contacts are rolled back and re-solved against the
+/// refreshed geometry.
+///
+/// A topology publication may despawn a body; Avian's removal observer
+/// swap-removes its solver body immediately. Resolve both indices by entity so
+/// a stale slot is never applied to the swapped body.
 fn rollback_requested_contact_impulses(
+    contact_graph: Res<ContactGraph>,
     mut solver_bodies: ResMut<SolverBodies>,
     mut constraint_graph: ResMut<ConstraintGraph>,
     mut re_solve_queue: ResMut<ContactReseolveQueue>,
@@ -961,6 +987,20 @@ fn rollback_requested_contact_impulses(
         for constraint in &mut color.contact_constraints {
             let affected = requested_contacts.binary_search(&constraint.contact_id).is_ok();
             if !affected {
+                continue;
+            }
+
+            let replacement = contact_graph
+                .get_by_id(constraint.contact_id)
+                .map(|(_, pair)| pair);
+            if !has_replacement_solver_manifold(
+                replacement,
+                constraint.body_entity1,
+                constraint.body_entity2,
+            ) {
+                // No replacement contact means the old impulse is the only
+                // record of this impact. Keep it instead of restoring the
+                // bodies to their pre-impact velocities.
                 continue;
             }
 
@@ -1675,6 +1715,74 @@ fn inverse_on_free_axes(inv_inertia: SymmetricTensor) -> SymmetricTensor {
 #[cfg(all(test, feature = "3d"))]
 mod fracture_contact_lifecycle_tests {
     use super::*;
+
+    use crate::collision::contact_types::{
+        ContactManifold, ContactPairFlags, ContactPoint,
+    };
+
+    fn live_contact_pair(
+        body1: Option<Entity>,
+        body2: Option<Entity>,
+    ) -> ContactPair {
+        let mut pair = ContactPair::new(
+            Entity::PLACEHOLDER,
+            Entity::PLACEHOLDER,
+            ContactId(38),
+        );
+        pair.body1 = body1;
+        pair.body2 = body2;
+        pair.flags.insert(
+            ContactPairFlags::TOUCHING | ContactPairFlags::GENERATE_CONSTRAINTS,
+        );
+        pair.manifolds.push(ContactManifold::new(
+            [ContactPoint::new(
+                Vec3::ZERO,
+                Vec3::ZERO,
+                Vec3::ZERO,
+                0.0,
+            )],
+            Vec3::Y,
+        ));
+        pair
+    }
+
+    #[test]
+    fn vanished_contact_keeps_its_already_applied_impact_impulse() {
+        let live = live_contact_pair(None, None);
+        assert!(has_replacement_solver_manifold(Some(&live), None, None));
+
+        let mut vanished = live.clone();
+        vanished.flags.remove(ContactPairFlags::TOUCHING);
+        vanished.manifolds.clear();
+        assert!(
+            !has_replacement_solver_manifold(Some(&vanished), None, None),
+            "a fully removed contact has no replacement impulse and must not be rolled back",
+        );
+        assert!(
+            !has_replacement_solver_manifold(None, None, None),
+            "a retired contact pair must keep its already-applied impulse",
+        );
+    }
+
+    #[test]
+    fn recycled_contact_id_for_another_body_pair_does_not_rollback_old_impulse() {
+        let recycled = live_contact_pair(Some(Entity::PLACEHOLDER), None);
+        assert!(
+            !has_replacement_solver_manifold(Some(&recycled), None, None),
+            "a reused contact ID is not the old body pair",
+        );
+    }
+
+    #[test]
+    fn only_touching_constraint_generating_manifolds_are_rollback_candidates() {
+        let mut sensor = live_contact_pair(None, None);
+        sensor.flags.remove(ContactPairFlags::GENERATE_CONSTRAINTS);
+        assert!(!has_replacement_solver_manifold(Some(&sensor), None, None));
+
+        let mut separated = live_contact_pair(None, None);
+        separated.flags.remove(ContactPairFlags::TOUCHING);
+        assert!(!has_replacement_solver_manifold(Some(&separated), None, None));
+    }
 
     #[test]
     fn removed_contact_is_pruned_before_solver_impulse_writeback() {
