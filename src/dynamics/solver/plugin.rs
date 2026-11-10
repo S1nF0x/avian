@@ -1426,6 +1426,8 @@ fn re_solve_requested_contacts(
         }
     }
 
+    drop(access);
+
     let re_solve_normal_impulse_ns = constraint_graph
         .colors
         .iter()
