@@ -641,15 +641,7 @@ impl Default for SolverConfig {
 pub struct ContactReseolveQueue {
     pending: Vec<ContactId>,
     prepared_contacts: Option<Vec<ContactId>>,
-    impulse_retention: HashMap<ContactId, ContactImpulseRetention>,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct ContactImpulseRetention {
-    linear_work_j: f64,
-    quadratic_work_j: f64,
-    fracture_work_j: f64,
-    failure_index: f64,
+    impulse_retention: HashMap<ContactId, f32>,
 }
 
 impl ContactReseolveQueue {
@@ -661,74 +653,31 @@ impl ContactReseolveQueue {
         self.pending.extend(contact_ids);
     }
 
-    /// Requests a contact rebuild while retaining the physically applied
-    /// impulse up to the material's failure point and fracture-surface work.
-    ///
-    /// linear_work_j and quadratic_work_j define the pair-level impulse work
-    /// polynomial W(s) = s*A - 0.5*s²*B. Multiple failing material owners on
-    /// the same contact accumulate their fracture work.
+    /// Requests a contact rebuild with a precomputed fraction of the applied
+    /// impulse retained. Material failure and energy accounting belong to the
+    /// caller; the solver only applies this scalar to its impulse ledger.
     pub fn request_impulse_retention(
         &mut self,
         contact_id: ContactId,
-        linear_work_j: f64,
-        quadratic_work_j: f64,
-        fracture_work_j: f64,
-        failure_index: f64,
+        retained_fraction: f32,
     ) -> f32 {
-        if !linear_work_j.is_finite()
-            || !quadratic_work_j.is_finite()
-            || !fracture_work_j.is_finite()
-            || !failure_index.is_finite()
-            || linear_work_j <= 0.0
-            || quadratic_work_j < 0.0
-            || fracture_work_j <= 0.0
-            || failure_index < 1.0
-        {
+        if !retained_fraction.is_finite() {
             return 1.0;
         }
 
+        let retained_fraction = retained_fraction.clamp(0.0, 1.0);
         self.request_contacts([contact_id]);
-        {
-            let retention = self.impulse_retention.entry(contact_id).or_insert(
-                ContactImpulseRetention {
-                    linear_work_j,
-                    quadratic_work_j,
-                    fracture_work_j: 0.0,
-                    failure_index: 0.0,
-                },
-            );
-
-            // All manifold points for one contact ID share the same pair-level
-            // work polynomial. Additional material owners contribute only their
-            // share of the fracture-surface cost.
-            debug_assert!(
-                (retention.linear_work_j - linear_work_j).abs()
-                    <= retention.linear_work_j.abs().max(linear_work_j.abs()).max(1.0) * 1.0e-4
-            );
-            debug_assert!(
-                (retention.quadratic_work_j - quadratic_work_j).abs()
-                    <= retention.quadratic_work_j.abs().max(quadratic_work_j.abs()).max(1.0) * 1.0e-4
-            );
-            retention.fracture_work_j += fracture_work_j;
-            retention.failure_index = retention.failure_index.max(failure_index);
-        }
-
-        // Return the exact fraction consumed by the rollback stage so the
-        // material owner can report and verify the actual impulse retention.
-        self.retained_impulse_fraction(contact_id).unwrap_or(1.0)
+        let stored = self
+            .impulse_retention
+            .entry(contact_id)
+            .and_modify(|current| *current = current.min(retained_fraction))
+            .or_insert(retained_fraction);
+        *stored
     }
 
-    /// Returns the impulse fraction that must remain committed before the
-    /// replacement contact is solved. The stress threshold and fracture work
-    /// are independent failure conditions, so both must have been reached.
+    /// Returns the precomputed impulse fraction for a refreshed contact pair.
     pub(crate) fn retained_impulse_fraction(&self, contact_id: ContactId) -> Option<f32> {
-        let retention = self.impulse_retention.get(&contact_id)?;
-        Some(material_failure_impulse_fraction(
-            retention.linear_work_j,
-            retention.quadratic_work_j,
-            retention.fracture_work_j,
-            retention.failure_index,
-        ))
+        self.impulse_retention.get(&contact_id).copied()
     }
 
     /// Whether topology publication requires the standard collider refresh pipeline.
@@ -779,54 +728,6 @@ impl ContactReseolveQueue {
         self.prepared_contacts = None;
         self.impulse_retention.clear();
     }
-}
-
-fn material_failure_impulse_fraction(
-    linear_work_j: f64,
-    quadratic_work_j: f64,
-    fracture_work_j: f64,
-    failure_index: f64,
-) -> f32 {
-    if !linear_work_j.is_finite()
-        || !quadratic_work_j.is_finite()
-        || !fracture_work_j.is_finite()
-        || !failure_index.is_finite()
-        || linear_work_j <= 0.0
-        || quadratic_work_j < 0.0
-        || fracture_work_j <= 0.0
-        || failure_index < 1.0
-    {
-        return 1.0;
-    }
-
-    let full_work = linear_work_j - 0.5 * quadratic_work_j;
-    if !full_work.is_finite() || full_work <= 0.0 || fracture_work_j >= full_work {
-        return 1.0;
-    }
-
-    // Solve s*A - 0.5*s²*B = G. This stable form avoids cancellation
-    // when a brittle material's surface work is tiny relative to impact work.
-    let energy_fraction = if quadratic_work_j > 1.0e-12 {
-        let discriminant =
-            (linear_work_j * linear_work_j - 2.0 * quadratic_work_j * fracture_work_j)
-                .max(0.0);
-        let denominator = linear_work_j + discriminant.sqrt();
-        if denominator > 0.0 {
-            2.0 * fracture_work_j / denominator
-        } else {
-            1.0
-        }
-    } else {
-        (fracture_work_j / linear_work_j).clamp(0.0, 1.0)
-    };
-
-    // Stress scales linearly with impulse, while the failure index is
-    // quadratic. Retain the impulse needed to reach strength even when the
-    // surface-energy threshold was reached earlier.
-    let strength_fraction = failure_index.sqrt().recip().clamp(0.0, 1.0);
-    energy_fraction
-        .max(strength_fraction)
-        .clamp(0.0, 1.0) as f32
 }
 
 /// A material contact whose configured normal impulse capacity was exceeded.
@@ -2046,47 +1947,23 @@ mod contact_re_solve_tests {
     use super::*;
 
     #[test]
-    fn material_failure_retains_only_the_impulse_needed_to_reach_failure() {
-        let fraction = material_failure_impulse_fraction(
-            200_000.0,
-            200_000.0,
-            45.0,
-            10_000.0,
-        );
-        assert!((fraction - 0.01).abs() < 1.0e-6);
-
-        let retained_work = fraction as f64 * 200_000.0
-            - 0.5 * (fraction as f64).powi(2) * 200_000.0;
-        assert!(retained_work >= 45.0);
-    }
-
-    #[test]
-    fn insufficient_energy_does_not_remove_the_contact_impulse() {
-        let fraction = material_failure_impulse_fraction(
-            100.0,
-            100.0,
-            60.0,
-            100.0,
-        );
-        assert_eq!(fraction, 1.0);
-    }
-
-    #[test]
-    fn multiple_material_owners_accumulate_fracture_work_for_one_contact() {
+    fn queue_stores_a_precomputed_retention_fraction() {
         let mut queue = ContactReseolveQueue::default();
-        queue.request_impulse_retention(ContactId(5), 200_000.0, 200_000.0, 10.0, 100.0);
-        let returned_fraction =
-            queue.request_impulse_retention(ContactId(5), 200_000.0, 200_000.0, 20.0, 400.0);
+        let fraction = queue.request_impulse_retention(ContactId(5), 0.25);
 
-        let expected = material_failure_impulse_fraction(
-            200_000.0,
-            200_000.0,
-            30.0,
-            400.0,
-        );
-        assert_eq!(returned_fraction, expected);
-        assert_eq!(queue.retained_impulse_fraction(ContactId(5)), Some(expected));
+        assert_eq!(fraction, 0.25);
+        assert_eq!(queue.retained_impulse_fraction(ContactId(5)), Some(0.25));
         assert!(queue.pending.contains(&ContactId(5)));
+    }
+
+    #[test]
+    fn repeated_retention_requests_keep_the_most_conservative_fraction() {
+        let mut queue = ContactReseolveQueue::default();
+        queue.request_impulse_retention(ContactId(5), 0.8);
+        let fraction = queue.request_impulse_retention(ContactId(5), 0.3);
+
+        assert_eq!(fraction, 0.3);
+        assert_eq!(queue.retained_impulse_fraction(ContactId(5)), Some(0.3));
     }
 
     #[test]
