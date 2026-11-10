@@ -1117,6 +1117,31 @@ fn rollback_requested_contact_impulses(
         return;
     };
 
+    // Snapshot the affected bodies before changing any impulse. This makes
+    // the rollback result independently observable from the subsequent re-solve.
+    let mut body_velocity_before = HashMap::<Entity, (Vector, Vector)>::new();
+    for color in &constraint_graph.colors {
+        for constraint in &color.contact_constraints {
+            if requested_contacts.binary_search(&constraint.contact_id).is_err() {
+                continue;
+            }
+            for entity in [constraint.body_entity1, constraint.body_entity2]
+                .into_iter()
+                .flatten()
+            {
+                let Some(index) = body_indices.get(entity).ok().copied() else {
+                    continue;
+                };
+                if let Some(body) = solver_bodies.get(index) {
+                    body_velocity_before.entry(entity).or_insert((
+                        body.linear_velocity,
+                        body.angular_velocity,
+                    ));
+                }
+            }
+        }
+    }
+
     let access = solver_bodies.access();
     let mut matched_constraints = 0usize;
     let mut matched_points = 0usize;
@@ -1194,6 +1219,29 @@ fn rollback_requested_contact_impulses(
                 normal_impulse_ns,
                 retained_fraction.map_or_else(|| "none".to_owned(), |value| format!("{value:.6}")),
             );
+        }
+    }
+
+    drop(access);
+    for (entity, (linear_before, angular_before)) in body_velocity_before {
+        let after = body_indices
+            .get(entity)
+            .ok()
+            .copied()
+            .and_then(|index| solver_bodies.get(index));
+        if let Some(body) = after {
+            info!(
+                "CONTACT_ROLLBACK_BODY entity={:?} linear_before={:?} linear_after={:?} delta_linear={:?} angular_before={:?} angular_after={:?} delta_angular={:?}",
+                entity,
+                linear_before,
+                body.linear_velocity,
+                body.linear_velocity - linear_before,
+                angular_before,
+                body.angular_velocity,
+                body.angular_velocity - angular_before,
+            );
+        } else {
+            info!("CONTACT_ROLLBACK_BODY entity={:?} solver_body=missing", entity);
         }
     }
 
@@ -1288,6 +1336,34 @@ fn re_solve_requested_contacts(
         requested_contacts.binary_search(&contact_id).is_ok()
     };
 
+    // Record body velocities immediately before the local pass. New
+    // constraints have a zero substep impulse ledger, so their ledger after
+    // this pass measures only impulse introduced by the re-solve.
+    let mut body_velocity_before =
+        HashMap::<Entity, (SolverBodyIndex, Vector, Vector)>::new();
+    for color in &constraint_graph.colors {
+        for constraint in &color.contact_constraints {
+            if !is_requested(constraint.contact_id) {
+                continue;
+            }
+            for (entity, index) in [
+                (constraint.body_entity1, constraint.body_index1),
+                (constraint.body_entity2, constraint.body_index2),
+            ] {
+                let Some(entity) = entity else {
+                    continue;
+                };
+                if let Some(body) = solver_bodies.get(index) {
+                    body_velocity_before.entry(entity).or_insert((
+                        index,
+                        body.linear_velocity,
+                        body.angular_velocity,
+                    ));
+                }
+            }
+        }
+    }
+
     let start = crate::utils::Instant::now();
     let solved_constraints = constraint_graph
         .colors
@@ -1350,14 +1426,41 @@ fn re_solve_requested_contacts(
         }
     }
 
+    let re_solve_normal_impulse_ns = constraint_graph
+        .colors
+        .iter()
+        .flat_map(|color| color.contact_constraints.iter())
+        .filter(|constraint| is_requested(constraint.contact_id))
+        .flat_map(|constraint| constraint.points.iter())
+        .map(|point| f64::from(point.substep_applied_impulses().0.max(0.0)))
+        .sum::<f64>();
+
     diagnostics.contact_re_solve_count += 1;
     diagnostics.contact_re_solve += start.elapsed();
     info!(
-        "CONTACT_RE_SOLVE_STAGE requested_contacts={} solved_constraints={} elapsed_ms={:.3}",
+        "CONTACT_RE_SOLVE_STAGE requested_contacts={} solved_constraints={} re_solve_normal_impulse_ns={:.3} elapsed_ms={:.3}",
         requested_contacts.len(),
         solved_constraints,
+        re_solve_normal_impulse_ns,
         start.elapsed().as_secs_f64() * 1_000.0,
     );
+
+    for (entity, (index, linear_before, angular_before)) in body_velocity_before {
+        if let Some(body) = solver_bodies.get(index) {
+            info!(
+                "CONTACT_RE_SOLVE_BODY entity={:?} linear_before={:?} linear_after={:?} delta_linear={:?} angular_before={:?} angular_after={:?} delta_angular={:?}",
+                entity,
+                linear_before,
+                body.linear_velocity,
+                body.linear_velocity - linear_before,
+                angular_before,
+                body.angular_velocity,
+                body.angular_velocity - angular_before,
+            );
+        } else {
+            info!("CONTACT_RE_SOLVE_BODY entity={:?} solver_body=missing", entity);
+        }
+    }
 }
 
 /// Emits one breakage message per contact pair whose configured normal
