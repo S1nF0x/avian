@@ -30,6 +30,7 @@ use bevy::{
     prelude::*,
 };
 use core::cmp::Ordering;
+use std::collections::HashMap;
 
 /// Manages and solves contacts, joints, and other constraints.
 ///
