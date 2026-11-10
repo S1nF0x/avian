@@ -1289,7 +1289,12 @@ fn re_solve_requested_contacts(
     };
 
     let start = crate::utils::Instant::now();
-    let mut solved_constraints = 0usize;
+    let solved_constraints = constraint_graph
+        .colors
+        .iter()
+        .flat_map(|color| color.contact_constraints.iter())
+        .filter(|constraint| is_requested(constraint.contact_id))
+        .count();
 
     // Unchanged constraints already applied their impulses this substep.
     // Re-solve only the rebuilt contacts, without warm starting them again.
@@ -1317,7 +1322,6 @@ fn re_solve_requested_contacts(
             .iter_mut()
         {
             if is_requested(constraint.contact_id) {
-                solved_constraints += 1;
                 solve_contacts_internal::<false>(
                     &access,
                     constraint,
@@ -1335,7 +1339,6 @@ fn re_solve_requested_contacts(
         {
             crate::utils::par_for_each(&mut color.contact_constraints, 64, |_i, constraint| {
                 if is_requested(constraint.contact_id) {
-                    solved_constraints += 1;
                     solve_contacts_internal::<false>(
                         &access,
                         constraint,
