@@ -1118,34 +1118,32 @@ fn rollback_requested_contact_impulses(
     };
 
     let access = solver_bodies.access();
+    let mut matched_constraints = 0usize;
+    let mut matched_points = 0usize;
+    let mut applied_normal_impulse_ns = 0.0_f64;
+    let mut retained_normal_impulse_ns = 0.0_f64;
+    let mut replacement_manifolds = 0usize;
+    let mut vanished_manifolds = 0usize;
+
     for color in &mut constraint_graph.colors {
         for constraint in &mut color.contact_constraints {
-            let affected = requested_contacts.binary_search(&constraint.contact_id).is_ok();
-            if !affected {
+            if requested_contacts.binary_search(&constraint.contact_id).is_err() {
                 continue;
             }
+            matched_constraints += 1;
+            matched_points += constraint.points.len();
 
-            if let Some(retained_fraction) =
-                re_solve_queue.retained_impulse_fraction(constraint.contact_id)
-            {
-                constraint.commit_substep_impulse_fraction(retained_fraction, &access);
-            }
+            let normal_impulse_ns = constraint
+                .points
+                .iter()
+                .map(|point| f64::from(point.substep_applied_impulses().0.max(0.0)))
+                .sum::<f64>();
+            let retained_fraction =
+                re_solve_queue.retained_impulse_fraction(constraint.contact_id);
 
-            let replacement = contact_graph
-                .get_by_id(constraint.contact_id)
-                .map(|(_, pair)| pair);
-            if !has_replacement_solver_manifold(
-                replacement,
-                constraint.body_entity1,
-                constraint.body_entity2,
-                constraint.manifold_index,
-            ) {
-                // No replacement contact means the old impulse is the only
-                // record of this impact. Keep it instead of restoring the
-                // bodies to their pre-impact velocities.
-                continue;
-            }
-
+            // A topology publication can despawn a body and make Avian
+            // swap-remove another body's solver slot. Refresh both indices
+            // BEFORE either the partial-retention or full-rollback operation.
             constraint.body_index1 = constraint
                 .body_entity1
                 .and_then(|entity| body_indices.get(entity).ok().copied())
@@ -1155,8 +1153,66 @@ fn rollback_requested_contact_impulses(
                 .and_then(|entity| body_indices.get(entity).ok().copied())
                 .unwrap_or(SolverBodyIndex::INVALID);
 
+            if let Some(fraction) = retained_fraction {
+                constraint.commit_substep_impulse_fraction(fraction, &access);
+                applied_normal_impulse_ns += normal_impulse_ns;
+                retained_normal_impulse_ns += normal_impulse_ns * f64::from(fraction);
+            }
+
+            let replacement = contact_graph
+                .get_by_id(constraint.contact_id)
+                .map(|(_, pair)| pair);
+            let has_replacement = has_replacement_solver_manifold(
+                replacement,
+                constraint.body_entity1,
+                constraint.body_entity2,
+                constraint.manifold_index,
+            );
+
+            if !has_replacement {
+                vanished_manifolds += 1;
+                info!(
+                    "CONTACT_IMPULSE_ROLLBACK contact_id={} manifold={} points={} normal_impulse_ns={:.3} retained_fraction={} replacement=false",
+                    constraint.contact_id,
+                    constraint.manifold_index,
+                    constraint.points.len(),
+                    normal_impulse_ns,
+                    retained_fraction.map_or_else(|| "none".to_owned(), |value| format!("{value:.6}")),
+                );
+                // No replacement contact means the retained impulse is the
+                // only record of this impact. Keep it committed.
+                continue;
+            }
+
+            replacement_manifolds += 1;
             constraint.rollback_substep_impulses(&access);
+            info!(
+                "CONTACT_IMPULSE_ROLLBACK contact_id={} manifold={} points={} normal_impulse_ns={:.3} retained_fraction={} replacement=true",
+                constraint.contact_id,
+                constraint.manifold_index,
+                constraint.points.len(),
+                normal_impulse_ns,
+                retained_fraction.map_or_else(|| "none".to_owned(), |value| format!("{value:.6}")),
+            );
         }
+    }
+
+    if matched_constraints == 0 {
+        info!(
+            "CONTACT_IMPULSE_ROLLBACK_STAGE requested_contacts={} matched_constraints=0",
+            requested_contacts.len(),
+        );
+    } else {
+        info!(
+            "CONTACT_IMPULSE_ROLLBACK_STAGE requested_contacts={} matched_constraints={} matched_points={} applied_normal_impulse_ns={:.3} retained_normal_impulse_ns={:.3} replacement_manifolds={} vanished_manifolds={}",
+            requested_contacts.len(),
+            matched_constraints,
+            matched_points,
+            applied_normal_impulse_ns,
+            retained_normal_impulse_ns,
+            replacement_manifolds,
+            vanished_manifolds,
+        );
     }
 }
 
@@ -1176,6 +1232,11 @@ fn rebuild_requested_contact_constraints(
     let Some(requested_contacts) = re_solve_queue.take_for_rebuild() else {
         return;
     };
+
+    info!(
+        "CONTACT_REBUILD_STAGE requested_contacts={}",
+        requested_contacts.len(),
+    );
 
     // Solver-body indices are refreshed by entity identity after any
     // fracture-driven body insertion/removal. Impulse rollback already
@@ -1228,6 +1289,7 @@ fn re_solve_requested_contacts(
     };
 
     let start = crate::utils::Instant::now();
+    let mut solved_constraints = 0usize;
 
     // Unchanged constraints already applied their impulses this substep.
     // Re-solve only the rebuilt contacts, without warm starting them again.
@@ -1255,6 +1317,7 @@ fn re_solve_requested_contacts(
             .iter_mut()
         {
             if is_requested(constraint.contact_id) {
+                solved_constraints += 1;
                 solve_contacts_internal::<false>(
                     &access,
                     constraint,
@@ -1272,6 +1335,7 @@ fn re_solve_requested_contacts(
         {
             crate::utils::par_for_each(&mut color.contact_constraints, 64, |_i, constraint| {
                 if is_requested(constraint.contact_id) {
+                    solved_constraints += 1;
                     solve_contacts_internal::<false>(
                         &access,
                         constraint,
@@ -1285,6 +1349,12 @@ fn re_solve_requested_contacts(
 
     diagnostics.contact_re_solve_count += 1;
     diagnostics.contact_re_solve += start.elapsed();
+    info!(
+        "CONTACT_RE_SOLVE_STAGE requested_contacts={} solved_constraints={} elapsed_ms={:.3}",
+        requested_contacts.len(),
+        solved_constraints,
+        start.elapsed().as_secs_f64() * 1_000.0,
+    );
 }
 
 /// Emits one breakage message per contact pair whose configured normal
