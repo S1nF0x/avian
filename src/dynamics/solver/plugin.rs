@@ -1197,9 +1197,13 @@ fn rollback_requested_contact_impulses(
             if !has_replacement {
                 vanished_manifolds += 1;
                 info!(
-                    "CONTACT_IMPULSE_ROLLBACK contact_id={:?} manifold={} points={} normal_impulse_ns={:.3} retained_fraction={} replacement=false",
+                    "CONTACT_IMPULSE_ROLLBACK contact_id={:?} manifold={} body1={:?} body2={:?} normal={:?} normal_speed={:.4} points={} normal_impulse_ns={:.3} retained_fraction={} replacement=false",
                     constraint.contact_id,
                     constraint.manifold_index,
+                    constraint.body_entity1,
+                    constraint.body_entity2,
+                    constraint.normal,
+                    constraint.normal_speed,
                     constraint.points.len(),
                     normal_impulse_ns,
                     retained_fraction.map_or_else(|| "none".to_owned(), |value| format!("{value:.6}")),
@@ -1212,9 +1216,13 @@ fn rollback_requested_contact_impulses(
             replacement_manifolds += 1;
             constraint.rollback_substep_impulses(&access);
             info!(
-                "CONTACT_IMPULSE_ROLLBACK contact_id={:?} manifold={} points={} normal_impulse_ns={:.3} retained_fraction={} replacement=true",
+                "CONTACT_IMPULSE_ROLLBACK contact_id={:?} manifold={} body1={:?} body2={:?} normal={:?} normal_speed={:.4} points={} normal_impulse_ns={:.3} retained_fraction={} replacement=true",
                 constraint.contact_id,
                 constraint.manifold_index,
+                constraint.body_entity1,
+                constraint.body_entity2,
+                constraint.normal,
+                constraint.normal_speed,
                 constraint.points.len(),
                 normal_impulse_ns,
                 retained_fraction.map_or_else(|| "none".to_owned(), |value| format!("{value:.6}")),
@@ -1436,6 +1444,51 @@ fn re_solve_requested_contacts(
         .flat_map(|constraint| constraint.points.iter())
         .map(|point| f64::from(point.substep_applied_impulses().0.max(0.0)))
         .sum::<f64>();
+
+    // Keep the re-solve attributable to exact refreshed manifolds. The old
+    // manifold index is not a stable identity across narrow-phase refreshes;
+    // log the new body pair, normal, approach speed, separations and impulse.
+    for color in &constraint_graph.colors {
+        for constraint in &color.contact_constraints {
+            if !is_requested(constraint.contact_id) {
+                continue;
+            }
+            let normal_impulse_ns = constraint
+                .points
+                .iter()
+                .map(|point| f64::from(point.substep_applied_impulses().0.max(0.0)))
+                .sum::<f64>();
+            let separation_min = constraint
+                .points
+                .iter()
+                .map(|point| point.initial_separation)
+                .fold(f32::INFINITY, f32::min);
+            let separation_max = constraint
+                .points
+                .iter()
+                .map(|point| point.initial_separation)
+                .fold(f32::NEG_INFINITY, f32::max);
+            let anchors: Vec<_> = constraint
+                .points
+                .iter()
+                .map(|point| (point.anchor1, point.anchor2))
+                .collect();
+            info!(
+                "CONTACT_RE_SOLVE_MANIFOLD contact_id={:?} manifold={} body1={:?} body2={:?} normal={:?} normal_speed={:.4} separation_min={:.4} separation_max={:.4} points={} normal_impulse_ns={:.3} anchors={:?}",
+                constraint.contact_id,
+                constraint.manifold_index,
+                constraint.body_entity1,
+                constraint.body_entity2,
+                constraint.normal,
+                constraint.normal_speed,
+                separation_min,
+                separation_max,
+                constraint.points.len(),
+                normal_impulse_ns,
+                anchors,
+            );
+        }
+    }
 
     diagnostics.contact_re_solve_count += 1;
     diagnostics.contact_re_solve += start.elapsed();
