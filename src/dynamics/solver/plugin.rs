@@ -670,7 +670,7 @@ impl ContactReseolveQueue {
         let stored = self
             .impulse_retention
             .entry(contact_id)
-            .and_modify(|current| *current = current.min(retained_fraction))
+            .and_modify(|current| *current = (*current).min(retained_fraction))
             .or_insert(retained_fraction);
         *stored
     }
