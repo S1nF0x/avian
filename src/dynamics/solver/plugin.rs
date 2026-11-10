@@ -1172,7 +1172,7 @@ fn rollback_requested_contact_impulses(
             if !has_replacement {
                 vanished_manifolds += 1;
                 info!(
-                    "CONTACT_IMPULSE_ROLLBACK contact_id={} manifold={} points={} normal_impulse_ns={:.3} retained_fraction={} replacement=false",
+                    "CONTACT_IMPULSE_ROLLBACK contact_id={:?} manifold={} points={} normal_impulse_ns={:.3} retained_fraction={} replacement=false",
                     constraint.contact_id,
                     constraint.manifold_index,
                     constraint.points.len(),
@@ -1187,7 +1187,7 @@ fn rollback_requested_contact_impulses(
             replacement_manifolds += 1;
             constraint.rollback_substep_impulses(&access);
             info!(
-                "CONTACT_IMPULSE_ROLLBACK contact_id={} manifold={} points={} normal_impulse_ns={:.3} retained_fraction={} replacement=true",
+                "CONTACT_IMPULSE_ROLLBACK contact_id={:?} manifold={} points={} normal_impulse_ns={:.3} retained_fraction={} replacement=true",
                 constraint.contact_id,
                 constraint.manifold_index,
                 constraint.points.len(),
