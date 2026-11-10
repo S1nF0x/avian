@@ -640,6 +640,15 @@ impl Default for SolverConfig {
 pub struct ContactReseolveQueue {
     pending: Vec<ContactId>,
     prepared_contacts: Option<Vec<ContactId>>,
+    impulse_retention: HashMap<ContactId, ContactImpulseRetention>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ContactImpulseRetention {
+    linear_work_j: f64,
+    quadratic_work_j: f64,
+    fracture_work_j: f64,
+    failure_index: f64,
 }
 
 impl ContactReseolveQueue {
@@ -649,6 +658,70 @@ impl ContactReseolveQueue {
         contact_ids: impl IntoIterator<Item = ContactId>,
     ) {
         self.pending.extend(contact_ids);
+    }
+
+    /// Requests a contact rebuild while retaining the physically applied
+    /// impulse up to the material's failure point and fracture-surface work.
+    ///
+    /// linear_work_j and quadratic_work_j define the pair-level impulse work
+    /// polynomial W(s) = s*A - 0.5*s²*B. Multiple failing material owners on
+    /// the same contact accumulate their fracture work.
+    pub fn request_impulse_retention(
+        &mut self,
+        contact_id: ContactId,
+        linear_work_j: f64,
+        quadratic_work_j: f64,
+        fracture_work_j: f64,
+        failure_index: f64,
+    ) {
+        if !linear_work_j.is_finite()
+            || !quadratic_work_j.is_finite()
+            || !fracture_work_j.is_finite()
+            || !failure_index.is_finite()
+            || linear_work_j <= 0.0
+            || quadratic_work_j < 0.0
+            || fracture_work_j <= 0.0
+            || failure_index < 1.0
+        {
+            return;
+        }
+
+        self.request_contacts([contact_id]);
+        let retention = self.impulse_retention.entry(contact_id).or_insert(
+            ContactImpulseRetention {
+                linear_work_j,
+                quadratic_work_j,
+                fracture_work_j: 0.0,
+                failure_index: 0.0,
+            },
+        );
+
+        // All manifold points for one contact ID share the same pair-level
+        // work polynomial. Additional material owners contribute only their
+        // share of the fracture-surface cost.
+        debug_assert!(
+            (retention.linear_work_j - linear_work_j).abs()
+                <= retention.linear_work_j.abs().max(linear_work_j.abs()).max(1.0) * 1.0e-4
+        );
+        debug_assert!(
+            (retention.quadratic_work_j - quadratic_work_j).abs()
+                <= retention.quadratic_work_j.abs().max(quadratic_work_j.abs()).max(1.0) * 1.0e-4
+        );
+        retention.fracture_work_j += fracture_work_j;
+        retention.failure_index = retention.failure_index.max(failure_index);
+    }
+
+    /// Returns the impulse fraction that must remain committed before the
+    /// replacement contact is solved. The stress threshold and fracture work
+    /// are independent failure conditions, so both must have been reached.
+    pub(crate) fn retained_impulse_fraction(&self, contact_id: ContactId) -> Option<f32> {
+        let retention = self.impulse_retention.get(&contact_id)?;
+        Some(material_failure_impulse_fraction(
+            retention.linear_work_j,
+            retention.quadratic_work_j,
+            retention.fracture_work_j,
+            retention.failure_index,
+        ))
     }
 
     /// Whether topology publication requires the standard collider refresh pipeline.
@@ -681,6 +754,7 @@ impl ContactReseolveQueue {
         self.pending.dedup();
         let requested = core::mem::take(&mut self.pending);
         self.prepared_contacts = Some(requested.clone());
+        self.impulse_retention.clear();
         Some(requested)
     }
 
@@ -696,7 +770,56 @@ impl ContactReseolveQueue {
     fn clear_pending(&mut self) {
         self.pending.clear();
         self.prepared_contacts = None;
+        self.impulse_retention.clear();
     }
+}
+
+fn material_failure_impulse_fraction(
+    linear_work_j: f64,
+    quadratic_work_j: f64,
+    fracture_work_j: f64,
+    failure_index: f64,
+) -> f32 {
+    if !linear_work_j.is_finite()
+        || !quadratic_work_j.is_finite()
+        || !fracture_work_j.is_finite()
+        || !failure_index.is_finite()
+        || linear_work_j <= 0.0
+        || quadratic_work_j < 0.0
+        || fracture_work_j <= 0.0
+        || failure_index < 1.0
+    {
+        return 1.0;
+    }
+
+    let full_work = linear_work_j - 0.5 * quadratic_work_j;
+    if !full_work.is_finite() || full_work <= 0.0 || fracture_work_j >= full_work {
+        return 1.0;
+    }
+
+    // Solve s*A - 0.5*s²*B = G. This stable form avoids cancellation
+    // when a brittle material's surface work is tiny relative to impact work.
+    let energy_fraction = if quadratic_work_j > 1.0e-12 {
+        let discriminant =
+            (linear_work_j * linear_work_j - 2.0 * quadratic_work_j * fracture_work_j)
+                .max(0.0);
+        let denominator = linear_work_j + discriminant.sqrt();
+        if denominator > 0.0 {
+            2.0 * fracture_work_j / denominator
+        } else {
+            1.0
+        }
+    } else {
+        (fracture_work_j / linear_work_j).clamp(0.0, 1.0)
+    };
+
+    // Stress scales linearly with impulse, while the failure index is
+    // quadratic. Retain the impulse needed to reach strength even when the
+    // surface-energy threshold was reached earlier.
+    let strength_fraction = failure_index.sqrt().recip().clamp(0.0, 1.0);
+    energy_fraction
+        .max(strength_fraction)
+        .clamp(0.0, 1.0) as f32
 }
 
 /// A material contact whose configured normal impulse capacity was exceeded.
@@ -993,6 +1116,12 @@ fn rollback_requested_contact_impulses(
             let affected = requested_contacts.binary_search(&constraint.contact_id).is_ok();
             if !affected {
                 continue;
+            }
+
+            if let Some(retained_fraction) =
+                re_solve_queue.retained_impulse_fraction(constraint.contact_id)
+            {
+                constraint.commit_substep_impulse_fraction(retained_fraction, &access);
             }
 
             let replacement = contact_graph
@@ -1644,6 +1773,48 @@ pub fn joint_damping<T: Component + EntityConstraint<2>>(
 #[cfg(test)]
 mod contact_re_solve_tests {
     use super::*;
+
+    #[test]
+    fn material_failure_retains_only_the_impulse_needed_to_reach_failure() {
+        let fraction = material_failure_impulse_fraction(
+            200_000.0,
+            200_000.0,
+            45.0,
+            10_000.0,
+        );
+        assert!((fraction - 0.01).abs() < 1.0e-6);
+
+        let retained_work = fraction as f64 * 200_000.0
+            - 0.5 * (fraction as f64).powi(2) * 200_000.0;
+        assert!(retained_work >= 45.0);
+    }
+
+    #[test]
+    fn insufficient_energy_does_not_remove_the_contact_impulse() {
+        let fraction = material_failure_impulse_fraction(
+            100.0,
+            100.0,
+            60.0,
+            100.0,
+        );
+        assert_eq!(fraction, 1.0);
+    }
+
+    #[test]
+    fn multiple_material_owners_accumulate_fracture_work_for_one_contact() {
+        let mut queue = ContactReseolveQueue::default();
+        queue.request_impulse_retention(ContactId(5), 200_000.0, 200_000.0, 10.0, 100.0);
+        queue.request_impulse_retention(ContactId(5), 200_000.0, 200_000.0, 20.0, 400.0);
+
+        let expected = material_failure_impulse_fraction(
+            200_000.0,
+            200_000.0,
+            30.0,
+            400.0,
+        );
+        assert_eq!(queue.retained_impulse_fraction(ContactId(5)), Some(expected));
+        assert!(queue.pending.contains(&ContactId(5)));
+    }
 
     #[test]
     fn a_new_substep_discards_an_unconsumed_transaction() {
