@@ -661,8 +661,9 @@ impl ContactReseolveQueue {
         self.prepared_contacts.is_some()
     }
 
-    /// Returns the old constraints whose current-substep impulses must be
-    /// reversed before contact-status changes retire their manifolds.
+    /// Returns requested old constraints. The rollback stage reverses an
+    /// impulse only if refreshed geometry provides a replacement manifold;
+    /// impulses from contacts that fully disappeared remain committed.
     pub(crate) fn contacts_for_rollback(&mut self) -> Option<Vec<ContactId>> {
         if self.pending.is_empty() {
             return None;

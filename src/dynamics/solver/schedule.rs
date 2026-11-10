@@ -195,7 +195,8 @@ pub enum ContactBreakageSystems {
     RefreshNarrowPhase,
     /// Lets the material owner request the affected dynamic contact island.
     RefreshContacts,
-    /// Reverses current-substep impulses for the affected dynamic contact island.
+    /// Reverses current-substep impulses only for contacts with replacement
+    /// manifolds in the affected dynamic contact island.
     Rollback,
     /// Applies queued contact status changes and retires old constraints.
     Rebuild,
