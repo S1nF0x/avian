@@ -1196,14 +1196,25 @@ fn rollback_requested_contact_impulses(
 
             if !has_replacement {
                 vanished_manifolds += 1;
+                let normal_speed_min = constraint
+                    .points
+                    .iter()
+                    .map(|point| point.normal_speed)
+                    .fold(f32::INFINITY, f32::min);
+                let normal_speed_max = constraint
+                    .points
+                    .iter()
+                    .map(|point| point.normal_speed)
+                    .fold(f32::NEG_INFINITY, f32::max);
                 info!(
-                    "CONTACT_IMPULSE_ROLLBACK contact_id={:?} manifold={} body1={:?} body2={:?} normal={:?} normal_speed={:.4} points={} normal_impulse_ns={:.3} retained_fraction={} replacement=false",
+                    "CONTACT_IMPULSE_ROLLBACK contact_id={:?} manifold={} body1={:?} body2={:?} normal={:?} normal_speed_min={:.4} normal_speed_max={:.4} points={} normal_impulse_ns={:.3} retained_fraction={} replacement=false",
                     constraint.contact_id,
                     constraint.manifold_index,
                     constraint.body_entity1,
                     constraint.body_entity2,
                     constraint.normal,
-                    constraint.normal_speed,
+                    normal_speed_min,
+                    normal_speed_max,
                     constraint.points.len(),
                     normal_impulse_ns,
                     retained_fraction.map_or_else(|| "none".to_owned(), |value| format!("{value:.6}")),
@@ -1214,15 +1225,26 @@ fn rollback_requested_contact_impulses(
             }
 
             replacement_manifolds += 1;
+            let normal_speed_min = constraint
+                .points
+                .iter()
+                .map(|point| point.normal_speed)
+                .fold(f32::INFINITY, f32::min);
+            let normal_speed_max = constraint
+                .points
+                .iter()
+                .map(|point| point.normal_speed)
+                .fold(f32::NEG_INFINITY, f32::max);
             constraint.rollback_substep_impulses(&access);
             info!(
-                "CONTACT_IMPULSE_ROLLBACK contact_id={:?} manifold={} body1={:?} body2={:?} normal={:?} normal_speed={:.4} points={} normal_impulse_ns={:.3} retained_fraction={} replacement=true",
+                "CONTACT_IMPULSE_ROLLBACK contact_id={:?} manifold={} body1={:?} body2={:?} normal={:?} normal_speed_min={:.4} normal_speed_max={:.4} points={} normal_impulse_ns={:.3} retained_fraction={} replacement=true",
                 constraint.contact_id,
                 constraint.manifold_index,
                 constraint.body_entity1,
                 constraint.body_entity2,
                 constraint.normal,
-                constraint.normal_speed,
+                normal_speed_min,
+                normal_speed_max,
                 constraint.points.len(),
                 normal_impulse_ns,
                 retained_fraction.map_or_else(|| "none".to_owned(), |value| format!("{value:.6}")),
@@ -1458,6 +1480,16 @@ fn re_solve_requested_contacts(
                 .iter()
                 .map(|point| f64::from(point.substep_applied_impulses().0.max(0.0)))
                 .sum::<f64>();
+            let normal_speed_min = constraint
+                .points
+                .iter()
+                .map(|point| point.normal_speed)
+                .fold(f32::INFINITY, f32::min);
+            let normal_speed_max = constraint
+                .points
+                .iter()
+                .map(|point| point.normal_speed)
+                .fold(f32::NEG_INFINITY, f32::max);
             let separation_min = constraint
                 .points
                 .iter()
@@ -1474,13 +1506,14 @@ fn re_solve_requested_contacts(
                 .map(|point| (point.anchor1, point.anchor2))
                 .collect();
             info!(
-                "CONTACT_RE_SOLVE_MANIFOLD contact_id={:?} manifold={} body1={:?} body2={:?} normal={:?} normal_speed={:.4} separation_min={:.4} separation_max={:.4} points={} normal_impulse_ns={:.3} anchors={:?}",
+                "CONTACT_RE_SOLVE_MANIFOLD contact_id={:?} manifold={} body1={:?} body2={:?} normal={:?} normal_speed_min={:.4} normal_speed_max={:.4} separation_min={:.4} separation_max={:.4} points={} normal_impulse_ns={:.3} anchors={:?}",
                 constraint.contact_id,
                 constraint.manifold_index,
                 constraint.body_entity1,
                 constraint.body_entity2,
                 constraint.normal,
-                constraint.normal_speed,
+                normal_speed_min,
+                normal_speed_max,
                 separation_min,
                 separation_max,
                 constraint.points.len(),
