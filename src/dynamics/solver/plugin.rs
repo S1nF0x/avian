@@ -674,7 +674,7 @@ impl ContactReseolveQueue {
         quadratic_work_j: f64,
         fracture_work_j: f64,
         failure_index: f64,
-    ) {
+    ) -> f32 {
         if !linear_work_j.is_finite()
             || !quadratic_work_j.is_finite()
             || !fracture_work_j.is_finite()
@@ -684,32 +684,38 @@ impl ContactReseolveQueue {
             || fracture_work_j <= 0.0
             || failure_index < 1.0
         {
-            return;
+            return 1.0;
         }
 
         self.request_contacts([contact_id]);
-        let retention = self.impulse_retention.entry(contact_id).or_insert(
-            ContactImpulseRetention {
-                linear_work_j,
-                quadratic_work_j,
-                fracture_work_j: 0.0,
-                failure_index: 0.0,
-            },
-        );
+        {
+            let retention = self.impulse_retention.entry(contact_id).or_insert(
+                ContactImpulseRetention {
+                    linear_work_j,
+                    quadratic_work_j,
+                    fracture_work_j: 0.0,
+                    failure_index: 0.0,
+                },
+            );
 
-        // All manifold points for one contact ID share the same pair-level
-        // work polynomial. Additional material owners contribute only their
-        // share of the fracture-surface cost.
-        debug_assert!(
-            (retention.linear_work_j - linear_work_j).abs()
-                <= retention.linear_work_j.abs().max(linear_work_j.abs()).max(1.0) * 1.0e-4
-        );
-        debug_assert!(
-            (retention.quadratic_work_j - quadratic_work_j).abs()
-                <= retention.quadratic_work_j.abs().max(quadratic_work_j.abs()).max(1.0) * 1.0e-4
-        );
-        retention.fracture_work_j += fracture_work_j;
-        retention.failure_index = retention.failure_index.max(failure_index);
+            // All manifold points for one contact ID share the same pair-level
+            // work polynomial. Additional material owners contribute only their
+            // share of the fracture-surface cost.
+            debug_assert!(
+                (retention.linear_work_j - linear_work_j).abs()
+                    <= retention.linear_work_j.abs().max(linear_work_j.abs()).max(1.0) * 1.0e-4
+            );
+            debug_assert!(
+                (retention.quadratic_work_j - quadratic_work_j).abs()
+                    <= retention.quadratic_work_j.abs().max(quadratic_work_j.abs()).max(1.0) * 1.0e-4
+            );
+            retention.fracture_work_j += fracture_work_j;
+            retention.failure_index = retention.failure_index.max(failure_index);
+        }
+
+        // Return the exact fraction consumed by the rollback stage so the
+        // material owner can report and verify the actual impulse retention.
+        self.retained_impulse_fraction(contact_id).unwrap_or(1.0)
     }
 
     /// Returns the impulse fraction that must remain committed before the
