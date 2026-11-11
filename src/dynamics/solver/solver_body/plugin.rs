@@ -13,8 +13,8 @@ use crate::{
     },
     math::ToRealPrecision,
     prelude::{
-        AngularInertia, AppDiagnosticsExt, CenterOfMass, ComputedAngularInertia,
-        ComputedCenterOfMass, ComputedMass, Dominance, LockedAxes, Mass, MassPropertyHelper,
+        AppDiagnosticsExt, ComputedAngularInertia, ComputedCenterOfMass, ComputedMass, Dominance,
+        LockedAxes,
     },
     utils::{MIN_PAR_ITER_ENTITIES, ParallelQueryForEach},
 };
@@ -195,9 +195,7 @@ fn add_solver_body_inner(
     solver_bodies: &mut SolverBodies,
     commands: &mut Commands,
 ) {
-    let mut body = SolverBody::default();
-    body.flags.set(SolverBodyFlags::NEEDS_INITIALIZATION, true);
-    let index = solver_bodies.push(entity, body, SolverBodyInertia::default());
+    let index = solver_bodies.push(entity, SolverBody::default(), SolverBodyInertia::default());
     commands.entity(entity).try_insert(index);
 }
 
@@ -328,100 +326,6 @@ fn prepare_solver_bodies(
     );
 }
 
-/// Recomputes mass properties for solver bodies whose index, explicit mass data,
-/// or collider-derived mass data changed after the main physics prepare stage.
-pub(crate) fn update_new_solver_body_mass_properties(
-    query: Query<
-        Entity,
-        (
-            With<SolverBodyIndex>,
-            Or<(
-                Changed<SolverBodyIndex>,
-                Changed<Mass>,
-                Changed<AngularInertia>,
-                Changed<CenterOfMass>,
-            )>,
-        ),
-    >,
-    mut mass_helper: MassPropertyHelper,
-) {
-    for entity in &query {
-        mass_helper.update_mass_properties(entity);
-    }
-}
-
-/// Synchronizes solver state for bodies created or whose mass properties changed
-/// during a contact-breakage substep. New bodies receive their initial velocity
-/// from ECS; existing bodies keep the live solver velocity, including any
-/// impulse rollback already applied in this substep.
-///
-/// ECS velocity components are written back only after the physics schedule.
-/// Their Changed tick can therefore still be visible on the first substep of
-/// the next frame. Re-reading them here would overwrite the solver's current
-/// post-solve state with a stale pre-solve snapshot.
-pub(crate) fn prepare_new_solver_bodies(
-    mut solver_bodies: ResMut<SolverBodies>,
-    query: Query<(
-        &RigidBody,
-        &SolverBodyIndex,
-        &LinearVelocity,
-        &AngularVelocity,
-        &Rotation,
-        &ComputedMass,
-        &ComputedAngularInertia,
-        Option<&LockedAxes>,
-        Option<&Dominance>,
-        Has<CustomPositionIntegration>,
-    ), Or<(
-        Changed<SolverBodyIndex>,
-        Changed<ComputedMass>,
-        Changed<ComputedAngularInertia>,
-        Changed<ComputedCenterOfMass>,
-    )>>,
-) {
-    let access = solver_bodies.access();
-
-    for (rb, index, linear_velocity, angular_velocity, rotation, mass, angular_inertia, locked_axes, dominance, custom_position_integration) in &query {
-        // SAFETY: Each newly added solver-body index is unique and this loop is sequential.
-        let solver_body = unsafe { access.body_unchecked_mut(*index) };
-        let needs_initialization = solver_body.flags.contains(SolverBodyFlags::NEEDS_INITIALIZATION);
-        if needs_initialization {
-            solver_body.linear_velocity = linear_velocity.0;
-            solver_body.angular_velocity = angular_velocity.0;
-        }
-        if needs_initialization {
-            solver_body.delta_position = Vector::ZERO;
-            solver_body.delta_rotation = Rot::IDENTITY;
-        }
-        let inertial_properties = unsafe { access.inertia_unchecked_mut(*index) };
-
-        let locked_axes = locked_axes.copied().unwrap_or_default();
-        *inertial_properties = SolverBodyInertia::new(
-            mass.inverse(),
-            #[cfg(feature = "2d")]
-            angular_inertia.inverse(),
-            #[cfg(feature = "3d")]
-            angular_inertia.rotated(rotation.0).inverse(),
-            locked_axes,
-            dominance.map_or(0, |dominance| dominance.0),
-            rb.is_dynamic(),
-        );
-        if needs_initialization {
-            let mut flags = SolverBodyFlags(locked_axes.to_bits() as u32);
-            flags.set(SolverBodyFlags::IS_KINEMATIC, rb.is_kinematic());
-            flags.set(SolverBodyFlags::CUSTOM_POSITION_INTEGRATION, custom_position_integration);
-
-            #[cfg(feature = "3d")]
-            {
-                let epsilon = 1e-6;
-                let is_gyroscopic = !locked_axes.is_rotation_locked()
-                    && !angular_inertia.inverse().is_isotropic(epsilon);
-                flags.set(SolverBodyFlags::GYROSCOPIC_MOTION, is_gyroscopic);
-            }
-            solver_body.flags = flags;
-        }
-    }
-}
 /// Writes back solver body data to rigid bodies.
 #[allow(clippy::type_complexity)]
 fn writeback_solver_bodies(
@@ -503,48 +407,6 @@ mod tests {
             .resource::<SolverBodies>()
             .contains_entity(entity)
             && app.world().get::<SolverBodyIndex>(entity).is_some()
-    }
-
-    #[test]
-    fn substep_refresh_preserves_solver_owned_velocity_after_rollback() {
-        let mut app = create_app();
-        let entity = app.world_mut().spawn((
-            RigidBody::Dynamic,
-            LinearVelocity(Vec3::new(10.0, 0.0, 0.0)),
-            AngularVelocity(Vec3::ZERO),
-        )).id();
-
-        app.update();
-        // Initialize the newly created solver body before simulating a later
-        // topology refresh on an already-live body.
-        app.world_mut().run_schedule(SubstepSchedule);
-
-        let index = *app.world().get::<SolverBodyIndex>(entity).unwrap();
-        let expected_linear = Vec3::new(5.106, 0.0, 0.0);
-        let expected_angular = Vec3::new(0.0, 0.0, 0.25);
-        {
-            let mut bodies = app.world_mut().resource_mut::<SolverBodies>();
-            let body = bodies.get_mut(index).unwrap();
-            body.linear_velocity = expected_linear;
-            body.angular_velocity = expected_angular;
-        }
-
-        // ECS still contains the previous-step velocity. Mark both velocity
-        // components and the solver index changed, as happens around a
-        // topology/mass-property refresh, then run the substep preparation.
-        {
-            let mut entity_mut = app.world_mut().entity_mut(entity);
-            entity_mut.get_mut::<LinearVelocity>().unwrap().0 =
-                Vec3::new(10.0, 0.0, 0.0);
-            entity_mut.get_mut::<AngularVelocity>().unwrap().0 = Vec3::ZERO;
-            entity_mut.get_mut::<SolverBodyIndex>().unwrap().0 = index.0;
-        }
-
-        app.world_mut().run_schedule(SubstepSchedule);
-
-        let body = app.world().resource::<SolverBodies>().get(index).unwrap();
-        assert_eq!(body.linear_velocity, expected_linear);
-        assert_eq!(body.angular_velocity, expected_angular);
     }
 
     #[test]

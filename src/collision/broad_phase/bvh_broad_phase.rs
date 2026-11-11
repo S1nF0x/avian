@@ -7,10 +7,7 @@ use crate::{
     },
     collision::{CollisionDiagnostics, contact_types::ContactEdgeFlags},
     data_structures::pair_key::PairKey,
-    dynamics::{
-        joints::joint_graph::JointGraph,
-        solver::{ContactReseolveQueue, schedule::{ContactBreakageSystems, SubstepSchedule}},
-    },
+    dynamics::joints::joint_graph::JointGraph,
     prelude::*,
 };
 use bevy::{
@@ -47,12 +44,6 @@ where
         app.add_systems(
             PhysicsSchedule,
             collect_collision_pairs::<H>.in_set(BroadPhaseSystems::CollectCollisions),
-        );
-        app.add_systems(
-            SubstepSchedule,
-            collect_collision_pairs::<H>
-                .in_set(ContactBreakageSystems::RefreshBroadPhase)
-                .run_if(|queue: Res<ContactReseolveQueue>| queue.has_pending_rebuild()),
         );
     }
 }
@@ -180,15 +171,8 @@ fn collect_collision_pairs<H: CollisionHooks>(
 
     // Add the found collision pairs to the contact graph.
     for (proxy_key1, proxy_key2) in broad_collision_pairs {
-        // Proxy topology can change while a cloned BVH is being optimized.
-        // Never panic or publish a contact for a retired proxy if a stale
-        // primitive escaped the snapshot revision guard.
-        let Some(proxy1) = trees.get_proxy(proxy_key1) else {
-            continue;
-        };
-        let Some(proxy2) = trees.get_proxy(proxy_key2) else {
-            continue;
-        };
+        let proxy1 = trees.get_proxy(proxy_key1).unwrap();
+        let proxy2 = trees.get_proxy(proxy_key2).unwrap();
 
         let mut contact_edge = ContactEdge::new(proxy1.collider, proxy2.collider);
         contact_edge.body1 = proxy1.body;
@@ -252,12 +236,7 @@ fn query_tree(
                 continue;
             }
 
-            let Some(proxy2) = tree.get_proxy(proxy_id2) else {
-                // A retired proxy may remain in an invalidated BVH snapshot.
-                // It is not a collision candidate and must not crash the
-                // parallel broad-phase traversal.
-                continue;
-            };
+            let proxy2 = tree.get_proxy(proxy_id2).unwrap();
 
             // Avoid duplicate pairs for moving proxies.
             //

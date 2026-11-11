@@ -3,6 +3,7 @@ use bevy::reflect::Reflect;
 #[cfg(feature = "serialize")]
 use bevy::reflect::{ReflectDeserialize, ReflectSerialize};
 
+// TODO: Block solver for solving two contact points simultaneously
 // TODO: One-body constraint version
 /// The normal part of a [`ContactConstraintPoint`](super::ContactConstraintPoint).
 /// Aims to resolve overlap.
@@ -14,21 +15,11 @@ pub struct ContactNormalPart {
     /// The magnitude of the contact impulse along the contact normal.
     pub impulse: f32,
 
-    /// Optional capacity for the accumulated normal constraint impulse (N*s).
-    /// Defaults to infinity. A material solver can configure this just after
-    /// contact constraint generation and before warm starting. Unlike scaling
-    /// effective_mass, this bound is enforced on the actual solver impulse,
-    /// including relaxation and restitution.
+    /// Maximum accumulated normal impulse for the current substep.
     pub max_impulse: f32,
 
-    /// True once the unconstrained solver requested more impulse than the
-    /// configured capacity. Caller may defer a material topology change to
-    /// a safe physics boundary; this method never mutates colliders.
+    /// Set when the requested normal impulse exceeds the material capacity.
     pub capacity_exceeded: bool,
-
-    /// The largest uncapped accumulated impulse requested during this
-    /// substep. This is exposed for breakage diagnostics and reset at warm start.
-    pub last_requested_impulse: f32,
 
     /// The total normal impulse applied across substeps and restitution.
     /// The unit is typically N⋅s or kg⋅m/s.
@@ -120,73 +111,55 @@ impl ContactNormalPart {
             impulse: warm_start_impulse.unwrap_or_default(),
             max_impulse: f32::INFINITY,
             capacity_exceeded: false,
-            last_requested_impulse: 0.0,
             total_impulse: 0.0,
             effective_mass: k.recip_or_zero(),
             softness,
         }
     }
 
-    /// Configure a physical contact impulse ceiling without altering the
-    /// effective mass tensor. Call before warm starting the constraint.
+    /// Sets the maximum normal impulse for this contact point.
     ///
-    /// Reconfiguring the capacity after impulses have already been applied
-    /// cannot undo them; consumers must not change this during a solve.
+    /// This only limits the solver impulse; it does not change effective mass.
     pub fn set_maximum_normal_impulse(&mut self, max_impulse_ns: f32) {
         self.max_impulse = if max_impulse_ns.is_finite() {
             max_impulse_ns.max(0.0)
         } else {
             f32::INFINITY
         };
-        // Warm-start values from a stronger previous contact are not allowed
-        // to bypass the new material constraint.
         self.impulse = self.impulse.clamp(0.0, self.max_impulse);
     }
 
-    /// Clears the transient material-failure signal for a new solver substep.
+    /// Returns the cached normal impulse used for warm starting, limited by material capacity.
+    #[inline]
+    pub fn warm_start_impulse(&self, coefficient: f32) -> f32 {
+        let impulse = coefficient * self.impulse;
+        if self.max_impulse.is_finite() {
+            impulse.clamp(0.0, self.max_impulse)
+        } else {
+            impulse
+        }
+    }
+
+    /// Clears transient failure state at the start of a substep.
+    #[inline]
     pub(crate) fn reset_substep_state(&mut self) {
         self.capacity_exceeded = false;
-        self.last_requested_impulse = 0.0;
     }
 
-    /// Returns the *applied* warm-start normal impulse. Scaling a cached
-    /// impulse must not bypass a breakable material's contact capacity.
-    ///
-    /// Ordinary, unbounded contacts retain the original warm-start behavior.
-    /// This does not change the accumulated impulse stored for the solve.
-    pub fn warm_start_impulse(&self, coefficient: f32) -> f32 {
-        if !coefficient.is_finite() {
-            return 0.0;
-        }
-        let scaled = coefficient * self.impulse;
-        if self.max_impulse.is_finite() {
-            if scaled.is_finite() {
-                scaled.clamp(0.0, self.max_impulse)
-            } else {
-                0.0
-            }
-        } else {
-            scaled
-        }
-    }
-
-    /// Clamp an actual accumulated constraint impulse. Shared by the normal
-    /// solver and restitution, so neither can inject uncapped momentum.
-    pub fn clamp_accumulated_impulse(&mut self, proposed: f32) -> f32 {
-        // Once this material point has failed, its already-transmitted impulse
-        // is irreversible for the rest of the substep. Do not retract it when
-        // a later PGS iteration changes the unconstrained proposal.
+    /// Clamps a requested accumulated impulse and returns the actual increment.
+    #[inline]
+    pub fn clamp_accumulated_impulse(&mut self, requested_impulse: f32) -> f32 {
         if self.capacity_exceeded {
             return 0.0;
         }
-        self.last_requested_impulse = self.last_requested_impulse.max(proposed);
-        let new_impulse = proposed.max(0.0).min(self.max_impulse);
-        if proposed.is_finite() && proposed > self.max_impulse {
+        let requested = requested_impulse.max(0.0);
+        if requested > self.max_impulse {
             self.capacity_exceeded = true;
         }
-        let applied_delta = new_impulse - self.impulse;
+        let new_impulse = requested.min(self.max_impulse);
+        let applied = new_impulse - self.impulse;
         self.impulse = new_impulse;
-        applied_delta
+        applied
     }
 
     /// Solves the non-penetration constraint, updating the total impulse in `self` and returning
@@ -199,22 +172,10 @@ impl ContactNormalPart {
         max_overlap_solve_speed: f32,
         delta_secs: f32,
     ) -> f32 {
-        if self.capacity_exceeded {
-            return 0.0;
-        }
         // Compute the relative velocity along the normal.
         let normal_speed = relative_velocity.dot(normal);
 
         // Compute the incremental normal impulse.
-        // The speculative branch divides by the step duration. Keep the
-        // public solver primitive finite even when a custom caller supplies a
-        // zero or invalid duration; normal Avian schedules already provide a
-        // positive value, so this is only a numerical safety rail.
-        let delta_secs = if delta_secs.is_finite() && delta_secs > 1.0e-6 {
-            delta_secs
-        } else {
-            1.0e-6
-        };
         let mut impulse = if separation > 0.0 {
             // Speculative contact: Push back the part of the velocity that would cause penetration.
             -self.effective_mass * (normal_speed + separation / delta_secs)
@@ -244,112 +205,11 @@ impl ContactNormalPart {
             -self.effective_mass * normal_speed
         };
 
-        // Enforce the real normal impulse bound in the velocity solve, not
-        // via a fabricated effective mass or post-solver velocity refund.
+        // Clamp the accumulated impulse to the material capacity.
         impulse = self.clamp_accumulated_impulse(self.impulse + impulse);
-        // `total_impulse` is the impulse applied this solve, not the running
-        // accumulated state. Adding `self.impulse` here counted the entire
-        // warm-started impulse once per iteration and inflated fracture work
-        // for resting stacks. Only the newly applied delta belongs in the
-        // per-substep total.
         self.total_impulse += impulse;
 
         // Return the clamped incremental normal impulse.
         impulse
     }
 }
-
-#[cfg(test)]
-mod material_capacity_tests {
-    use super::*;
-
-    fn part(warm_start: f32) -> ContactNormalPart {
-        ContactNormalPart {
-            impulse: warm_start,
-            max_impulse: f32::INFINITY,
-            capacity_exceeded: false,
-            last_requested_impulse: 0.0,
-            total_impulse: 0.0,
-            effective_mass: 2.0,
-            softness: SoftnessCoefficients {
-                bias: 0.0,
-                impulse_scale: 0.0,
-                mass_scale: 1.0,
-            },
-        }
-    }
-
-    #[test]
-    fn actual_normal_impulse_is_clamped_but_effective_mass_is_not_changed() {
-        let mut normal = part(0.0);
-        normal.set_maximum_normal_impulse(5.0);
-        let applied = normal.solve_impulse::<false>(
-            0.0, Vector::splat(-10.0), Vector::X, 0.0, 1.0 / 60.0,
-        );
-        assert_eq!(applied, 5.0);
-        assert_eq!(normal.impulse, 5.0);
-        assert_eq!(normal.effective_mass, 2.0);
-        assert!(normal.capacity_exceeded);
-        assert_eq!(normal.clamp_accumulated_impulse(20.0), 0.0);
-    }
-
-    #[test]
-    fn warm_start_cannot_bypass_new_capacity() {
-        let mut normal = part(80.0);
-        normal.set_maximum_normal_impulse(3.0);
-        assert_eq!(normal.impulse, 3.0);
-        assert_eq!(normal.clamp_accumulated_impulse(4.0), 0.0);
-        assert!(normal.capacity_exceeded);
-    }
-
-    #[test]
-    fn capped_warm_start_cannot_apply_more_than_the_material_capacity() {
-        let mut normal = part(4.0);
-        normal.set_maximum_normal_impulse(5.0);
-        assert_eq!(normal.warm_start_impulse(2.0), 5.0);
-        assert_eq!(normal.warm_start_impulse(0.5), 2.0);
-        assert_eq!(normal.impulse, 4.0);
-
-        normal.set_maximum_normal_impulse(0.0);
-        assert_eq!(normal.warm_start_impulse(2.0), 0.0);
-        assert_eq!(normal.warm_start_impulse(f32::NAN), 0.0);
-    }
-
-    #[test]
-    fn capacity_breach_is_scoped_to_one_substep() {
-        let mut normal = part(0.0);
-        normal.set_maximum_normal_impulse(5.0);
-        normal.clamp_accumulated_impulse(8.0);
-        assert!(normal.capacity_exceeded);
-        assert_eq!(normal.last_requested_impulse, 8.0);
-
-        normal.reset_substep_state();
-
-        assert!(!normal.capacity_exceeded);
-        assert_eq!(normal.last_requested_impulse, 0.0);
-        assert_eq!(normal.impulse, 5.0);
-    }
-
-    #[test]
-    fn ordinary_contacts_are_unbounded() {
-        let mut normal = part(0.0);
-        assert_eq!(normal.clamp_accumulated_impulse(123.0), 123.0);
-        assert_eq!(normal.warm_start_impulse(2.0), 246.0);
-        assert!(!normal.capacity_exceeded);
-    }
-
-    #[test]
-    fn total_impulse_counts_applied_delta_once_per_iteration() {
-        let mut normal = part(0.0);
-        normal.solve_impulse::<false>(
-            0.0, Vector::splat(-10.0), Vector::X, 0.0, 1.0 / 60.0,
-        );
-        let first = normal.total_impulse;
-        normal.solve_impulse::<false>(
-            0.0, Vector::ZERO, Vector::X, 0.0, 1.0 / 60.0,
-        );
-        assert!(first > 0.0);
-        assert_eq!(normal.total_impulse, first);
-    }
-}
-

@@ -25,13 +25,7 @@ pub use system_param::{ContactStatusChange, ContactStatusChangeQueue, NarrowPhas
 
 use core::marker::PhantomData;
 
-use crate::{
-    dynamics::{
-        joints::joint_graph::JointGraph,
-        solver::{ContactReseolveQueue, schedule::{ContactBreakageSystems, SubstepSchedule}},
-    },
-    prelude::*,
-};
+use crate::{dynamics::joints::joint_graph::JointGraph, prelude::*};
 use bevy::{
     ecs::{
         entity_disabling::Disabled,
@@ -128,13 +122,6 @@ where
                 .in_set(NarrowPhaseSystems::Update)
                 // Allowing ambiguities is required so that it's possible
                 // to have multiple collision backends at the same time.
-                .ambiguous_with_all(),
-        );
-        app.add_systems(
-            SubstepSchedule,
-            update_narrow_phase::<C, H>
-                .in_set(ContactBreakageSystems::RefreshNarrowPhase)
-                .run_if(|queue: Res<ContactReseolveQueue>| queue.has_pending_rebuild())
                 .ambiguous_with_all(),
         );
 
@@ -264,7 +251,6 @@ fn update_narrow_phase<C: AnyCollider, H: CollisionHooks + 'static>(
     mut collision_started_writer: MessageWriter<CollisionStart>,
     mut collision_ended_writer: MessageWriter<CollisionEnd>,
     time: Res<Time>,
-    step_revision: Res<PhysicsStepRevision>,
     hooks: StaticSystemParam<H>,
     context: StaticSystemParam<C::Context>,
     mut commands: ParallelCommands,
@@ -283,8 +269,6 @@ fn update_narrow_phase<C: AnyCollider, H: CollisionHooks + 'static>(
         &mut diagnostics,
         &mut commands,
     );
-
-    narrow_phase.contact_graph.revision = step_revision.0;
 
     diagnostics.narrow_phase = start.elapsed();
     diagnostics.contact_count = narrow_phase.contact_graph.edges.edge_count() as u32;

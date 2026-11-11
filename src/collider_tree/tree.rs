@@ -32,13 +32,6 @@ pub struct ColliderTree {
     pub moved_proxies: MovedProxyList,
     /// A workspace for reusing allocations across tree operations.
     pub workspace: ColliderTreeWorkspace,
-    /// Changes to the live proxy set invalidate an asynchronous BVH
-    /// optimization snapshot. AABB-only changes are rebased onto the optimized
-    /// tree when the snapshot completes.
-    pub(crate) topology_revision: u64,
-    /// Increments when leaf AABBs change without changing proxy identity.
-    /// Optimized snapshots can rebase these changes before installation.
-    pub(crate) aabb_revision: u64,
 }
 
 /// A set of [`ProxyId`]s that have moved since the last update, in insertion order.
@@ -224,16 +217,6 @@ impl Clone for ColliderTreeWorkspace {
 }
 
 impl ColliderTree {
-    #[inline]
-    fn mark_mutated(&mut self) {
-        self.topology_revision = self.topology_revision.wrapping_add(1);
-    }
-
-    #[inline]
-    fn mark_aabb_updated(&mut self) {
-        self.aabb_revision = self.aabb_revision.wrapping_add(1);
-    }
-
     /// Adds a proxy to the tree, returning its index.
     #[inline]
     pub fn add_proxy(&mut self, aabb: Aabb, proxy: ColliderTreeProxy) -> ProxyId {
@@ -244,7 +227,6 @@ impl ColliderTree {
 
         // Add to moved proxies.
         self.moved_proxies.push(ProxyId::new(id));
-        self.mark_mutated();
 
         ProxyId::new(id)
     }
@@ -260,7 +242,6 @@ impl ColliderTree {
 
             // Remove from moved proxies.
             self.moved_proxies.remove(proxy_id);
-            self.mark_mutated();
 
             Some(proxy)
         } else {
@@ -340,7 +321,6 @@ impl ColliderTree {
 
         // Update the proxy's AABB in the BVH.
         self.bvh.nodes[node_index].set_aabb(aabb);
-        self.mark_aabb_updated();
     }
 
     /// Resizes the AABB of a proxy in the tree.
@@ -354,7 +334,6 @@ impl ColliderTree {
     pub fn resize_proxy_aabb(&mut self, proxy_id: ProxyId, aabb: Aabb) {
         let node_index = self.bvh.primitives_to_nodes[proxy_id.index()] as usize;
         self.bvh.resize_node(node_index, aabb);
-        self.mark_aabb_updated();
     }
 
     /// Updates the AABB of a proxy and reinserts it at an optimal place in the tree.
@@ -364,7 +343,6 @@ impl ColliderTree {
         let node_id = self.bvh.primitives_to_nodes[proxy_id.index()];
         self.bvh.resize_node(node_id as usize, aabb);
         self.bvh.reinsert_node(node_id as usize);
-        self.mark_aabb_updated();
     }
 
     /// Refits the entire tree from the leaves up.

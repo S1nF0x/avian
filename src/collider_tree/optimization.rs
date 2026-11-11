@@ -3,7 +3,6 @@ use crate::data_structures::stable_vec::StableVec;
 use crate::{
     collider_tree::{
         ColliderTree, ColliderTreeDiagnostics, ColliderTreeSystems, ColliderTreeType, ColliderTrees,
-        ProxyId,
     },
     prelude::*,
 };
@@ -247,13 +246,16 @@ fn optimize_trees(
         }
 
         #[cfg(all(not(target_arch = "wasm32"), not(target_os = "unknown")))]
-        if use_compute_task && !optimization_settings.optimize_in_place {
+        if use_compute_task {
             // Take or clone the BVH for the optimization task.
             // TODO: For small changes to large trees, the cost of cloning can exceed the cost of the task.
             //       We could have a threshold for cloning vs in-place optimization based on tree size and moved ratio.
-            // Keep the live BVH available for same-step fracture edits.
-            // In-place mode is run synchronously below.
-            let bvh = tree.bvh.clone();
+            let bvh = if optimization_settings.optimize_in_place {
+                core::mem::take(&mut tree.bvh)
+            } else {
+                // TODO: Can we avoid cloning the entire BVH?
+                tree.bvh.clone()
+            };
 
             // Create a new tree for the optimization task.
             let new_tree = ColliderTree {
@@ -262,8 +264,6 @@ fn optimize_trees(
                 // These are not needed during the simulation step.
                 moved_proxies: core::mem::take(&mut tree.moved_proxies),
                 workspace: core::mem::take(&mut tree.workspace),
-                topology_revision: tree.topology_revision,
-                aabb_revision: tree.aabb_revision,
             };
 
             optimization_tasks.jobs.push(Arc::new(OptimizationJob {
@@ -274,9 +274,8 @@ fn optimize_trees(
             }));
         }
 
-        if !use_compute_task || optimization_settings.optimize_in_place {
-            // Optimize in place on the main thread; this is synchronous when
-            // the caller requests in-place mode so collider edits cannot race.
+        if !use_compute_task {
+            // Optimize in place on the main thread.
             optimize_tree_in_place(tree, optimization_strategy);
         }
     }
@@ -358,37 +357,7 @@ fn finish_optimize_trees(
     for job in jobs {
         let mut tree = job.tree.lock().unwrap_or_else(|err| err.into_inner());
         let collider_tree = collider_trees.tree_for_type_mut(job.tree_type);
-        if collider_tree.topology_revision == tree.topology_revision {
-            // The proxy set is unchanged. Moving bodies may have updated leaf
-            // AABBs while the snapshot was optimized, so rebase those changes
-            // only when the live AABB revision differs from the snapshot.
-            if collider_tree.aabb_revision != tree.aabb_revision {
-                let current_aabbs = collider_tree.proxies.iter()
-                    .filter_map(|(index, _)| {
-                        let proxy_id = ProxyId::new(index as u32);
-                        Some((proxy_id, collider_tree.get_proxy_aabb(proxy_id)?))
-                    })
-                    .collect::<Vec<_>>();
-                collider_tree.bvh = core::mem::take(&mut tree.bvh);
-                for (proxy_id, aabb) in current_aabbs {
-                    collider_tree.set_proxy_aabb(proxy_id, aabb);
-                }
-                collider_tree.refit_all();
-            } else {
-                collider_tree.bvh = core::mem::take(&mut tree.bvh);
-            }
-        } else {
-            // A substep fracture changed the live tree after the snapshot was
-            // cloned. Its BVH already contains those add/remove/AABB edits;
-            // installing the optimized snapshot would resurrect removed proxy
-            // IDs and omit new ones. Keep the live BVH and reschedule every
-            // surviving proxy that was pending when the snapshot was taken.
-            for proxy_id in tree.moved_proxies.iter().copied() {
-                if collider_tree.get_proxy(proxy_id).is_some() {
-                    collider_tree.moved_proxies.push(proxy_id);
-                }
-            }
-        }
+        collider_tree.bvh = core::mem::take(&mut tree.bvh);
         collider_tree.workspace = core::mem::take(&mut tree.workspace);
     }
 

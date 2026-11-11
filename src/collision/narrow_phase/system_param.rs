@@ -34,7 +34,6 @@ struct ColliderQuery<C: AnyCollider> {
     layers: Read<CollisionLayers>,
     friction: Option<Read<Friction>>,
     restitution: Option<Read<Restitution>>,
-    max_normal_impulse: Option<Read<ContactImpulseLimit>>,
     collision_margin: Option<Read<CollisionMargin>>,
     is_sensor: Has<Sensor>,
 }
@@ -51,7 +50,6 @@ struct RigidBodyQuery {
     // TODO: We should define these as purely collider components and not query for them here.
     friction: Option<Read<Friction>>,
     restitution: Option<Read<Restitution>>,
-    max_normal_impulse: Option<Read<ContactImpulseLimit>>,
     collision_margin: Option<Read<CollisionMargin>>,
     speculative_ccd: Option<Read<SpeculativeCcd>>,
     size_metrics: Read<BodySizeMetrics>,
@@ -172,97 +170,8 @@ impl<C: AnyCollider> NarrowPhase<'_, '_, C> {
         for<'w, 's> SystemParamItem<'w, 's, H>: CollisionHooks,
     {
         // Update contacts for all contact pairs.
-        self.update_contacts::<H>(None, delta_secs, hooks, context, diagnostics, commands);
-        self.process_contact_status_changes(None, collision_started_writer, collision_ended_writer);
-    }
+        self.update_contacts::<H>(delta_secs, hooks, context, diagnostics, commands);
 
-    /// Recomputes actual narrow-phase manifolds for one contact after an
-    /// application changes that pair's collider geometry during a substep.
-    ///
-    /// This is intentionally local: unrelated contact pairs are not recomputed.
-    /// The method records contact-status changes for the solver to consume in
-    /// the same substep. Call it only after publishing the changed collider.
-    pub fn refresh_contact_pair<H: CollisionHooks>(
-        &mut self,
-        contact_id: ContactId,
-        collision_started_writer: &mut MessageWriter<CollisionStart>,
-        collision_ended_writer: &mut MessageWriter<CollisionEnd>,
-        delta_secs: f32,
-        hooks: &SystemParamItem<H>,
-        context: &SystemParamItem<C::Context>,
-        diagnostics: &mut CollisionDiagnostics,
-        commands: &mut ParallelCommands,
-    ) -> bool
-    where
-        for<'w, 's> SystemParamItem<'w, 's, H>: CollisionHooks,
-    {
-        let Some((collider1, collider2, body1, body2, was_touching, events_enabled, generates_constraints)) =
-            self.contact_graph.get_by_id(contact_id).map(|(edge, pair)| (
-                pair.collider1,
-                pair.collider2,
-                pair.body1,
-                pair.body2,
-                edge.is_touching(),
-                edge.events_enabled(),
-                pair.generates_constraints(),
-            ))
-        else {
-            return false;
-        };
-
-        // A voxel cut can retire a child collider entirely. Remove its graph
-        // edge and queue constraint removal rather than leaving a stale impulse.
-        if self.collider_query.get_many([collider1, collider2]).is_err() {
-            if was_touching && events_enabled {
-                collision_ended_writer.write(CollisionEnd {
-                    collider1,
-                    collider2,
-                    body1,
-                    body2,
-                });
-            }
-            Self::remove_colliding_entities(
-                &mut self.colliding_entities_query,
-                collider1,
-                collider2,
-            );
-            if generates_constraints
-                && let (Some(body1), Some(body2)) = (body1, body2)
-            {
-                self.contact_status_changes.push(
-                    ContactStatusChange::StoppedGeneratingConstraints {
-                        contact_id,
-                        body1,
-                        body2,
-                    },
-                );
-            }
-            self.contact_graph.remove_edge_by_id(
-                &PairKey::new(collider1.index_u32(), collider2.index_u32()),
-                contact_id,
-            );
-            return false;
-        }
-
-        // Geometry can change without either collider moving or its AABB changing,
-        // as with an interior voxel cut. Contact recycling only compares relative
-        // poses, so it would otherwise reuse the pre-edit manifold and preserve
-        // contacts inside the newly opened topology.
-        if let Some((_, pair)) = self.contact_graph.get_mut_by_id(contact_id) {
-            pair.recycling_cache = None;
-        }
-
-        self.update_contacts::<H>(Some(contact_id), delta_secs, hooks, context, diagnostics, commands);
-        self.process_contact_status_changes(Some(contact_id), collision_started_writer, collision_ended_writer);
-        self.contact_graph.get_by_id(contact_id).is_some()
-    }
-
-    fn process_contact_status_changes(
-        &mut self,
-        only_contact: Option<ContactId>,
-        collision_started_writer: &mut MessageWriter<CollisionStart>,
-        collision_ended_writer: &mut MessageWriter<CollisionEnd>,
-    ) {
         // Process contact status changes, iterating over set bits serially to maintain determinism.
         //
         // The narrow phase only updates the `ContactGraph` and records `ContactStatusChange`s.
@@ -274,11 +183,6 @@ impl<C: AnyCollider> NarrowPhase<'_, '_, C> {
             while bits != 0 {
                 let trailing_zeros = bits.trailing_zeros();
                 let contact_id = ContactId(i as u32 * 64 + trailing_zeros);
-
-                if only_contact.is_some_and(|target| target != contact_id) {
-                    bits &= bits - 1;
-                    continue;
-                }
 
                 let (contact_edge, contact_pair) = self
                     .contact_graph
@@ -353,8 +257,8 @@ impl<C: AnyCollider> NarrowPhase<'_, '_, C> {
                     );
 
                     contact_edge.flags.set(ContactEdgeFlags::TOUCHING, true);
-                    // Clear both edge transition flags; otherwise the same
-                    // contact may be scheduled twice on a later substep.
+
+                    // Clear the status change flags.
                     contact_pair
                         .flags
                         .set(ContactPairFlags::STARTED_TOUCHING, false);
@@ -394,8 +298,8 @@ impl<C: AnyCollider> NarrowPhase<'_, '_, C> {
                     );
 
                     contact_edge.flags.set(ContactEdgeFlags::TOUCHING, false);
-                    // Clear the ended-touch flag before queuing the current
-                    // loss of the contact constraint.
+
+                    // Clear the status change flags.
                     contact_pair
                         .flags
                         .set(ContactPairFlags::STOPPED_TOUCHING, false);
@@ -488,7 +392,6 @@ impl<C: AnyCollider> NarrowPhase<'_, '_, C> {
     /// The order of contact pairs is preserved.
     fn update_contacts<H: CollisionHooks>(
         &mut self,
-        only_contact: Option<ContactId>,
         delta_secs: f32,
         hooks: &SystemParamItem<H>,
         collider_context: &SystemParamItem<C::Context>,
@@ -541,9 +444,6 @@ impl<C: AnyCollider> NarrowPhase<'_, '_, C> {
         //       and to chunk it into smaller bit vectors for each thread. Might not be any faster though.
         crate::utils::par_for_each(self.contact_graph.active_pairs_mut(), 64, |_i, contacts| {
             let contact_id = contacts.contact_id.0 as usize;
-            if only_contact.is_some_and(|target| target.0 as usize != contact_id) {
-                return;
-            }
 
             #[cfg(not(feature = "parallel"))]
             let contact_status_bits = &mut self.contact_status_bits;
@@ -624,7 +524,6 @@ impl<C: AnyCollider> NarrowPhase<'_, '_, C> {
                     lin_vel1,
                     ang_vel1,
                     rb_friction1,
-                    rb_max_normal_impulse1,
                     rb_collision_margin1,
                     speculative_ccd1,
                     size_metrics1,
@@ -640,7 +539,6 @@ impl<C: AnyCollider> NarrowPhase<'_, '_, C> {
                             body.linear_velocity.0,
                             body.angular_velocity.0,
                             body.friction,
-                            body.max_normal_impulse,
                             body.collision_margin,
                             body.speculative_ccd.copied(),
                             *body.size_metrics,
@@ -656,7 +554,6 @@ impl<C: AnyCollider> NarrowPhase<'_, '_, C> {
                     lin_vel2,
                     ang_vel2,
                     rb_friction2,
-                    rb_max_normal_impulse2,
                     rb_collision_margin2,
                     speculative_ccd2,
                     size_metrics2,
@@ -672,30 +569,12 @@ impl<C: AnyCollider> NarrowPhase<'_, '_, C> {
                             body.linear_velocity.0,
                             body.angular_velocity.0,
                             body.friction,
-                            body.max_normal_impulse,
                             body.collision_margin,
                             body.speculative_ccd.copied(),
                             *body.size_metrics,
                         )
                     })
                     .unwrap_or_default();
-
-                // A collider-level material overrides its body's value. The
-                // contact uses the smaller finite capacity so either material
-                // can be the weak link in a breakable surface.
-                let max_normal_impulse1 = collider1
-                    .max_normal_impulse
-                    .or(rb_max_normal_impulse1)
-                    .copied()
-                    .unwrap_or_default();
-                let max_normal_impulse2 = collider2
-                    .max_normal_impulse
-                    .or(rb_max_normal_impulse2)
-                    .copied()
-                    .unwrap_or_default();
-                let max_normal_impulse = max_normal_impulse1
-                    .combine(max_normal_impulse2)
-                    .normalized();
 
                 // Store these to avoid having to query for the bodies
                 // when processing status changes for the constraint graph.
@@ -803,7 +682,6 @@ impl<C: AnyCollider> NarrowPhase<'_, '_, C> {
                     let com12 = world_com2 - world_com1 + pos12;
 
                     contacts.manifolds.iter_mut().for_each(|manifold| {
-                        manifold.max_normal_impulse = max_normal_impulse;
                         manifold.points.iter_mut().for_each(|point| {
                             // Keep anchors but update separation. This eliminates jitter.
                             let r1 = delta_rot1 * point.anchor1;
@@ -943,7 +821,6 @@ impl<C: AnyCollider> NarrowPhase<'_, '_, C> {
                     // Set the initial surface properties.
                     manifold.friction = friction;
                     manifold.restitution = restitution;
-                    manifold.max_normal_impulse = max_normal_impulse;
                     #[cfg(feature = "2d")]
                     {
                         manifold.tangent_speed = 0.0;

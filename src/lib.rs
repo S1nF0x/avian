@@ -578,7 +578,7 @@ pub mod prelude {
         physics_transform::{PhysicsTransformHelper, PhysicsTransformPlugin, Position, Rotation},
         schedule::{
             Physics, PhysicsSchedule, PhysicsSchedulePlugin, PhysicsSet, PhysicsStepSet,
-            PhysicsStepRevision, PhysicsStepSystems, PhysicsSystems, PhysicsTime, Substeps,
+            PhysicsStepSystems, PhysicsSystems, PhysicsTime, Substeps,
         },
         spatial_query::{self, *},
     };

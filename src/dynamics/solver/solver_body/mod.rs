@@ -12,7 +12,6 @@
 mod plugin;
 
 pub use plugin::SolverBodyPlugin;
-pub(crate) use plugin::{prepare_new_solver_bodies, update_new_solver_body_mass_properties};
 
 use core::marker::PhantomData;
 
@@ -167,9 +166,6 @@ bitflags::bitflags! {
         /// Set during the continuous collision stage if the body's motion was stopped
         /// at a time of impact. Transient.
         const HAD_TIME_OF_IMPACT = 1 << 10;
-        /// Marks a newly inserted solver body that has not yet received its
-        /// mass, inertia, velocity, and lock state from its rigid-body entity.
-        const NEEDS_INITIALIZATION = 1 << 11;
     }
 }
 
