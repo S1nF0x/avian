@@ -1247,6 +1247,29 @@ fn rebuild_requested_contact_constraints(
     );
 }
 
+/// Computes the current signed separation using the same body deltas and
+/// rotated contact anchors as the velocity solver. The stored offset alone is
+/// not the current gap: it must be combined with both anchors and body motion.
+fn current_contact_separation(
+    stored_separation_offset: f32,
+    anchor1: Vector,
+    anchor2: Vector,
+    normal: Vector,
+    body1: Option<&SolverBody>,
+    body2: Option<&SolverBody>,
+) -> f32 {
+    let delta_position1 = body1.map_or(Vector::ZERO, |body| body.delta_position);
+    let delta_position2 = body2.map_or(Vector::ZERO, |body| body.delta_position);
+    let rotated_anchor1 =
+        body1.map_or(anchor1, |body| body.delta_rotation * anchor1);
+    let rotated_anchor2 =
+        body2.map_or(anchor2, |body| body.delta_rotation * anchor2);
+
+    (delta_position2 - delta_position1 + rotated_anchor2 - rotated_anchor1)
+        .dot(normal)
+        + stored_separation_offset
+}
+
 /// Re-solves the rebuilt contact constraints once after a breakage system has
 /// refreshed the affected manifolds. Positions are not integrated a second time.
 #[allow(clippy::too_many_arguments)]
@@ -1391,12 +1414,42 @@ fn re_solve_requested_contacts(
                 .iter()
                 .map(|point| point.normal_speed)
                 .fold(f32::NEG_INFINITY, f32::max);
-            let separation_min = constraint
+            let body1 = solver_bodies.get(constraint.body_index1);
+            let body2 = solver_bodies.get(constraint.body_index2);
+            let current_separation_min = constraint
+                .points
+                .iter()
+                .map(|point| {
+                    current_contact_separation(
+                        point.initial_separation,
+                        point.anchor1,
+                        point.anchor2,
+                        constraint.normal,
+                        body1,
+                        body2,
+                    )
+                })
+                .fold(f32::INFINITY, f32::min);
+            let current_separation_max = constraint
+                .points
+                .iter()
+                .map(|point| {
+                    current_contact_separation(
+                        point.initial_separation,
+                        point.anchor1,
+                        point.anchor2,
+                        constraint.normal,
+                        body1,
+                        body2,
+                    )
+                })
+                .fold(f32::NEG_INFINITY, f32::max);
+            let stored_offset_min = constraint
                 .points
                 .iter()
                 .map(|point| point.initial_separation)
                 .fold(f32::INFINITY, f32::min);
-            let separation_max = constraint
+            let stored_offset_max = constraint
                 .points
                 .iter()
                 .map(|point| point.initial_separation)
@@ -1407,7 +1460,7 @@ fn re_solve_requested_contacts(
                 .map(|point| (point.anchor1, point.anchor2))
                 .collect();
             debug!(
-                "CONTACT_RE_SOLVE_MANIFOLD contact_id={:?} manifold={} body1={:?} body2={:?} normal={:?} normal_speed_min={:.4} normal_speed_max={:.4} separation_min={:.4} separation_max={:.4} points={} normal_impulse_ns={:.3} anchors={:?}",
+                "CONTACT_RE_SOLVE_MANIFOLD contact_id={:?} manifold={} body1={:?} body2={:?} normal={:?} normal_speed_min={:.4} normal_speed_max={:.4} current_separation_min={:.4} current_separation_max={:.4} stored_offset_min={:.4} stored_offset_max={:.4} points={} normal_impulse_ns={:.3} anchors={:?}",
                 constraint.contact_id,
                 constraint.manifold_index,
                 constraint.body_entity1,
@@ -1415,8 +1468,10 @@ fn re_solve_requested_contacts(
                 constraint.normal,
                 normal_speed_min,
                 normal_speed_max,
-                separation_min,
-                separation_max,
+                current_separation_min,
+                current_separation_max,
+                stored_offset_min,
+                stored_offset_max,
                 constraint.points.len(),
                 normal_impulse_ns,
                 anchors,
@@ -1945,6 +2000,39 @@ pub fn joint_damping<T: Component + EntityConstraint<2>>(
 #[cfg(test)]
 mod contact_re_solve_tests {
     use super::*;
+
+    #[test]
+    fn current_contact_separation_includes_body_motion() {
+        let mut body1 = SolverBody::default();
+        let mut body2 = SolverBody::default();
+        body1.delta_position = Vector::X * 0.1;
+        body2.delta_position = Vector::X * 0.4;
+
+        let separation = current_contact_separation(
+            0.5,
+            Vector::ZERO,
+            Vector::X * 0.2,
+            Vector::X,
+            Some(&body1),
+            Some(&body2),
+        );
+
+        assert!((separation - 1.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn current_contact_separation_handles_static_bodies() {
+        let separation = current_contact_separation(
+            0.5,
+            Vector::ZERO,
+            Vector::X * 0.2,
+            Vector::X,
+            None,
+            None,
+        );
+
+        assert!((separation - 0.7).abs() < 1.0e-6);
+    }
 
     #[test]
     fn queue_stores_a_precomputed_retention_fraction() {
