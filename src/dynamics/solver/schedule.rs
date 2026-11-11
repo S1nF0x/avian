@@ -172,14 +172,14 @@ pub enum SubstepSolverSystems {
 
 /// Extension points for material breakage and same-substep contact rebuilding.
 ///
-/// The [`Detect`](Self::Detect) set runs after the complete probe solve. Applications
+/// The [`Detect`](Self::Detect) set runs after the substep solve. Applications
 /// use [`Apply`](Self::Apply) to publish authoritative material and collider changes.
 /// Avian refreshes collider AABBs, broad-phase pairs, and narrow-phase manifolds.
-/// The owner restores the pre-probe solver state of affected dynamic islands in
-/// [`RestoreProbeState`](Self::RestoreProbeState). Avian then applies contact-status
-/// changes, prepares new solver bodies, rebuilds only requested constraints without
-/// warm-start impulses, and exposes [`PrepareReSolve`](Self::PrepareReSolve) before
-/// one final local solve in [`ReSolve`](Self::ReSolve).
+/// The owner preserves the first solve's already-applied impulses and commits the
+/// affected poses. Avian then applies contact-status changes, prepares new solver
+/// bodies, rebuilds only requested constraints without warm-start impulses, and
+/// exposes [`PrepareReSolve`](Self::PrepareReSolve) before one final local solve
+/// in [`ReSolve`](Self::ReSolve).
 #[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ContactBreakageSystems {
     /// Emits contact capacity failures detected by the solver.

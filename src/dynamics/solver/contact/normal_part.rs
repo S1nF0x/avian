@@ -173,6 +173,12 @@ impl ContactNormalPart {
     /// Clamp an actual accumulated constraint impulse. Shared by the normal
     /// solver and restitution, so neither can inject uncapped momentum.
     pub fn clamp_accumulated_impulse(&mut self, proposed: f32) -> f32 {
+        // Once this material point has failed, its already-transmitted impulse
+        // is irreversible for the rest of the substep. Do not retract it when
+        // a later PGS iteration changes the unconstrained proposal.
+        if self.capacity_exceeded {
+            return 0.0;
+        }
         self.last_requested_impulse = self.last_requested_impulse.max(proposed);
         let new_impulse = proposed.max(0.0).min(self.max_impulse);
         if proposed.is_finite() && proposed > self.max_impulse {
@@ -193,6 +199,9 @@ impl ContactNormalPart {
         max_overlap_solve_speed: f32,
         delta_secs: f32,
     ) -> f32 {
+        if self.capacity_exceeded {
+            return 0.0;
+        }
         // Compute the relative velocity along the normal.
         let normal_speed = relative_velocity.dot(normal);
 

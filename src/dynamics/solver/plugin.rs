@@ -952,8 +952,8 @@ fn rebuild_requested_contact_constraints(
     );
 
     // Solver-body indices are refreshed by entity identity after any
-    // fracture-driven body insertion/removal. The owner has restored the
-    // pre-probe state before contact-status changes prune the old constraints.
+    // fracture-driven body insertion/removal. The owner keeps the first solve's
+    // velocities and commits moved poses before changed contact pairs are rebuilt.
     for color in &mut constraint_graph.colors {
         for constraint in &mut color.contact_constraints {
             constraint.body_index1 = constraint
@@ -1004,8 +1004,9 @@ fn current_contact_separation(
         + stored_separation_offset
 }
 
-/// Performs the final solve on rebuilt contact constraints after a probe-state
-/// restore and geometry refresh. Positions are integrated only once afterward.
+/// Performs the final solve on rebuilt contacts after geometry refresh.
+/// The first solve's capped impulses remain in the solver-body velocities;
+/// only refreshed constraints are solved again, without warm starting them.
 #[allow(clippy::too_many_arguments)]
 fn re_solve_requested_contacts(
     mut solver_bodies: ResMut<SolverBodies>,
@@ -1066,10 +1067,10 @@ fn re_solve_requested_contacts(
     let max_overlap_solve_speed = solver_config.max_overlap_solve_speed * length_unit.0;
     let delta_secs = time.delta_secs();
 
-    // The probe result has been discarded by the owner for this dynamic island.
-    // Run the same biased solve and relaxation pair as the normal substep solver,
-    // but only for the refreshed contacts in the affected island. No warm-start
-    // impulse is applied to the rebuilt constraints.
+    // The initial solve is retained: its applied impulses are already present in
+    // solver-body velocities. Only newly refreshed constraints are solved here,
+    // so unchanged contacts cannot transmit their impulse a second time. The
+    // replacement constraints have no warm-start impulse.
     for constraint in constraint_graph.colors[COLOR_OVERFLOW_INDEX]
         .contact_constraints
         .iter_mut()

@@ -423,6 +423,11 @@ impl ContactConstraint {
             }
 
             old_impulses[i] = f64::from(old);
+            if point.normal_part.capacity_exceeded {
+                lower[i] = 0.0;
+                upper[i] = 0.0;
+                continue;
+            }
             lower[i] = -old_impulses[i];
             upper[i] = if capacity.is_finite() {
                 f64::from(capacity) - old_impulses[i]
@@ -595,6 +600,11 @@ impl ContactConstraint {
             let tangent_directions = self.tangent_directions();
 
             for point in self.points.iter_mut() {
+                // A failed material contact stops transmitting tangential
+                // impulse in the same substep as its normal capacity breach.
+                if point.normal_part.capacity_exceeded {
+                    continue;
+                }
                 let Some(ref mut friction_part) = point.tangent_part else {
                     continue;
                 };
@@ -679,7 +689,10 @@ impl ContactConstraint {
             }
             old_impulses[i] = f64::from(old);
 
-            if point.normal_speed > -threshold || point.normal_part.total_impulse == 0.0 {
+            if point.normal_speed > -threshold
+                || point.normal_part.total_impulse == 0.0
+                || point.normal_part.capacity_exceeded
+            {
                 lower[i] = 0.0;
                 upper[i] = 0.0;
                 continue;
@@ -806,7 +819,10 @@ impl ContactConstraint {
         let inv_angular_inertia2 = inertia2.effective_inv_angular_inertia();
 
         for point in self.points.iter_mut() {
-            if point.normal_speed > -threshold || point.normal_part.total_impulse == 0.0 {
+            if point.normal_speed > -threshold
+                || point.normal_part.total_impulse == 0.0
+                || point.normal_part.capacity_exceeded
+            {
                 continue;
             }
 
