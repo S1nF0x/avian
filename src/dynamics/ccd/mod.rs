@@ -739,7 +739,9 @@ fn solve_continuous(
 
             let shape1 = collider1.shape_scaled().as_ref();
 
-            // No swept CCD for trimeshes, heightfields, polylines, or voxels.
+            // Parry has native sparse voxel TOI traversal. Do not bypass voxel colliders:
+            // excluding them here also gives them infinite CCD thickness, so they are never
+            // classified as fast bodies and never reach compute_ccd_toi.
             if !crate::collision::collider::shape_supports_sweeps(shape1) {
                 continue;
             }
@@ -1202,3 +1204,136 @@ fn compute_ccd_toi(
     let toi = hit.time_of_impact.f32();
     (toi > 0.0 && toi < min_toi).then_some(toi)
 }
+
+#[cfg(all(test, feature = "3d", feature = "parry-f32"))]
+mod voxel_ccd_tests {
+    use super::*;
+    use parry::{
+        bounding_volume::Aabb,
+        math::{IVector, Pose, Vector},
+        shape::{Cuboid, SharedShape},
+    };
+
+    const DT: f32 = 1.0 / 60.0;
+
+    fn moving_motion(speed: f32) -> NonlinearRigidMotion {
+        NonlinearRigidMotion::new(
+            Pose::translation(-4.0, 0.0, 0.0),
+            Vector::ZERO,
+            Vector::new(speed, 0.0, 0.0),
+            Vector::ZERO,
+        )
+    }
+
+    fn fast_shape(shape: &dyn parry::shape::Shape) -> CcdFastShape<'_> {
+        CcdFastShape {
+            shape,
+            // This field is only consumed by the convex-proxy path. Voxel TOI uses
+            // Parry's sparse voxel traversal directly.
+            swept_aabb: Aabb::new(Vector::splat(-1.0), Vector::splat(1.0)),
+            local_centroid: Vector::ZERO,
+            min_extent: 0.1,
+        }
+    }
+
+    fn assert_toi(
+        mode: SweepMode,
+        moving_shape: &dyn parry::shape::Shape,
+        target_shape: &dyn parry::shape::Shape,
+        speed: f32,
+        latest_safe_origin_x: f32,
+    ) {
+        let moving = moving_motion(speed);
+        let stationary = NonlinearRigidMotion::constant_position(Pose::identity());
+        let fast = fast_shape(moving_shape);
+        let toi = compute_ccd_toi(
+            mode,
+            &moving,
+            &fast,
+            &stationary,
+            target_shape,
+            DT,
+            DT,
+            0.005,
+        )
+        .unwrap_or_else(|| {
+            panic!("missing voxel TOI: mode={mode:?}, speed={speed} m/s")
+        });
+
+        assert!(
+            toi.is_finite() && toi > 0.0 && toi < DT,
+            "invalid TOI {toi} at {speed} m/s (dt={DT})"
+        );
+
+        let impact_x = moving.position_at_time(toi).translation.x;
+        assert!(
+            impact_x <= latest_safe_origin_x,
+            "CCD stopped too late: speed={speed}, toi={toi}, body_x={impact_x}, safe_x={latest_safe_origin_x}"
+        );
+    }
+
+    #[test]
+    fn voxel_body_sweeps_into_convex_wall_at_supersonic_speeds() {
+        let moving_voxels =
+            SharedShape::voxels(Vector::splat(0.1), &[IVector::new(0, 0, 0)]);
+        let wall = SharedShape::new(Cuboid::new(Vector::new(0.05, 1.0, 1.0)));
+
+        assert!(crate::collision::collider::shape_supports_sweeps(
+            moving_voxels.as_ref()
+        ));
+        assert!((moving_voxels.ccd_thickness() - 0.1).abs() < 1.0e-6);
+
+        for speed in [343.0, 3430.0, 34300.0] {
+            assert_toi(
+                SweepMode::Linear,
+                moving_voxels.as_ref(),
+                wall.as_ref(),
+                speed,
+                -0.14,
+            );
+            assert_toi(
+                SweepMode::NonLinear,
+                moving_voxels.as_ref(),
+                wall.as_ref(),
+                speed,
+                -0.14,
+            );
+        }
+    }
+
+    #[test]
+    fn voxel_to_voxel_sweeps_find_supersonic_impact() {
+        let moving_voxels =
+            SharedShape::voxels(Vector::splat(0.1), &[IVector::new(0, 0, 0)]);
+        let target_voxels =
+            SharedShape::voxels(Vector::splat(0.1), &[IVector::new(0, 0, 0)]);
+
+        for speed in [343.0, 3430.0, 34300.0] {
+            assert_toi(
+                SweepMode::NonLinear,
+                moving_voxels.as_ref(),
+                target_voxels.as_ref(),
+                speed,
+                -0.09,
+            );
+        }
+    }
+
+    #[test]
+    fn convex_body_sweeps_into_voxel_wall_at_supersonic_speeds() {
+        let moving_cuboid = SharedShape::new(Cuboid::new(Vector::splat(0.05)));
+        let target_voxels =
+            SharedShape::voxels(Vector::splat(0.1), &[IVector::new(0, 0, 0)]);
+
+        for speed in [343.0, 3430.0, 34300.0] {
+            assert_toi(
+                SweepMode::NonLinear,
+                moving_cuboid.as_ref(),
+                target_voxels.as_ref(),
+                speed,
+                -0.04,
+            );
+        }
+    }
+}
+
