@@ -351,16 +351,21 @@ pub(crate) fn update_new_solver_body_mass_properties(
 }
 
 /// Synchronizes solver state for bodies created or whose mass properties changed
-/// during a contact-breakage substep. New bodies need full initialization; retained
-/// bodies preserve their accumulated substep deltas while receiving updated
-/// velocities and inertial properties.
+/// during a contact-breakage substep. New bodies receive their initial velocity
+/// from ECS; existing bodies keep the live solver velocity, including any
+/// impulse rollback already applied in this substep.
+///
+/// ECS velocity components are written back only after the physics schedule.
+/// Their Changed tick can therefore still be visible on the first substep of
+/// the next frame. Re-reading them here would overwrite the solver's current
+/// post-solve state with a stale pre-solve snapshot.
 pub(crate) fn prepare_new_solver_bodies(
     mut solver_bodies: ResMut<SolverBodies>,
     query: Query<(
         &RigidBody,
         &SolverBodyIndex,
-        Ref<LinearVelocity>,
-        Ref<AngularVelocity>,
+        &LinearVelocity,
+        &AngularVelocity,
         &Rotation,
         &ComputedMass,
         &ComputedAngularInertia,
@@ -372,8 +377,6 @@ pub(crate) fn prepare_new_solver_bodies(
         Changed<ComputedMass>,
         Changed<ComputedAngularInertia>,
         Changed<ComputedCenterOfMass>,
-        Changed<LinearVelocity>,
-        Changed<AngularVelocity>,
     )>>,
 ) {
     let access = solver_bodies.access();
@@ -382,7 +385,7 @@ pub(crate) fn prepare_new_solver_bodies(
         // SAFETY: Each newly added solver-body index is unique and this loop is sequential.
         let solver_body = unsafe { access.body_unchecked_mut(*index) };
         let needs_initialization = solver_body.flags.contains(SolverBodyFlags::NEEDS_INITIALIZATION);
-        if needs_initialization || linear_velocity.is_changed() || angular_velocity.is_changed() {
+        if needs_initialization {
             solver_body.linear_velocity = linear_velocity.0;
             solver_body.angular_velocity = angular_velocity.0;
         }
@@ -500,6 +503,48 @@ mod tests {
             .resource::<SolverBodies>()
             .contains_entity(entity)
             && app.world().get::<SolverBodyIndex>(entity).is_some()
+    }
+
+    #[test]
+    fn substep_refresh_preserves_solver_owned_velocity_after_rollback() {
+        let mut app = create_app();
+        let entity = app.world_mut().spawn((
+            RigidBody::Dynamic,
+            LinearVelocity(Vec3::new(10.0, 0.0, 0.0)),
+            AngularVelocity(Vec3::ZERO),
+        )).id();
+
+        app.update();
+        // Initialize the newly created solver body before simulating a later
+        // topology refresh on an already-live body.
+        app.world_mut().run_schedule(SubstepSchedule);
+
+        let index = *app.world().get::<SolverBodyIndex>(entity).unwrap();
+        let expected_linear = Vec3::new(5.106, 0.0, 0.0);
+        let expected_angular = Vec3::new(0.0, 0.0, 0.25);
+        {
+            let mut bodies = app.world_mut().resource_mut::<SolverBodies>();
+            let body = bodies.get_mut(index).unwrap();
+            body.linear_velocity = expected_linear;
+            body.angular_velocity = expected_angular;
+        }
+
+        // ECS still contains the previous-step velocity. Mark both velocity
+        // components and the solver index changed, as happens around a
+        // topology/mass-property refresh, then run the substep preparation.
+        {
+            let mut entity_mut = app.world_mut().entity_mut(entity);
+            entity_mut.get_mut::<LinearVelocity>().unwrap().0 =
+                Vec3::new(10.0, 0.0, 0.0);
+            entity_mut.get_mut::<AngularVelocity>().unwrap().0 = Vec3::ZERO;
+            entity_mut.get_mut::<SolverBodyIndex>().unwrap().0 = index.0;
+        }
+
+        app.world_mut().run_schedule(SubstepSchedule);
+
+        let body = app.world().resource::<SolverBodies>().get(index).unwrap();
+        assert_eq!(body.linear_velocity, expected_linear);
+        assert_eq!(body.angular_velocity, expected_angular);
     }
 
     #[test]

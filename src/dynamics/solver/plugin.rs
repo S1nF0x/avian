@@ -1107,7 +1107,7 @@ fn rollback_requested_contact_impulses(
                     .iter()
                     .map(|point| point.normal_speed)
                     .fold(f32::NEG_INFINITY, f32::max);
-                info!(
+                debug!(
                     "CONTACT_IMPULSE_ROLLBACK contact_id={:?} manifold={} body1={:?} body2={:?} normal={:?} normal_speed_min={:.4} normal_speed_max={:.4} points={} normal_impulse_ns={:.3} retained_fraction={} replacement=false",
                     constraint.contact_id,
                     constraint.manifold_index,
@@ -1137,7 +1137,7 @@ fn rollback_requested_contact_impulses(
                 .map(|point| point.normal_speed)
                 .fold(f32::NEG_INFINITY, f32::max);
             constraint.rollback_substep_impulses(&access);
-            info!(
+            debug!(
                 "CONTACT_IMPULSE_ROLLBACK contact_id={:?} manifold={} body1={:?} body2={:?} normal={:?} normal_speed_min={:.4} normal_speed_max={:.4} points={} normal_impulse_ns={:.3} retained_fraction={} replacement=true",
                 constraint.contact_id,
                 constraint.manifold_index,
@@ -1161,7 +1161,7 @@ fn rollback_requested_contact_impulses(
             .copied()
             .and_then(|index| solver_bodies.get(index));
         if let Some(body) = after {
-            info!(
+            debug!(
                 "CONTACT_ROLLBACK_BODY entity={:?} linear_before={:?} linear_after={:?} delta_linear={:?} angular_before={:?} angular_after={:?} delta_angular={:?}",
                 entity,
                 linear_before,
@@ -1172,7 +1172,7 @@ fn rollback_requested_contact_impulses(
                 body.angular_velocity - angular_before,
             );
         } else {
-            info!("CONTACT_ROLLBACK_BODY entity={:?} solver_body=missing", entity);
+            debug!("CONTACT_ROLLBACK_BODY entity={:?} solver_body=missing", entity);
         }
     }
 
@@ -1406,7 +1406,7 @@ fn re_solve_requested_contacts(
                 .iter()
                 .map(|point| (point.anchor1, point.anchor2))
                 .collect();
-            info!(
+            debug!(
                 "CONTACT_RE_SOLVE_MANIFOLD contact_id={:?} manifold={} body1={:?} body2={:?} normal={:?} normal_speed_min={:.4} normal_speed_max={:.4} separation_min={:.4} separation_max={:.4} points={} normal_impulse_ns={:.3} anchors={:?}",
                 constraint.contact_id,
                 constraint.manifold_index,
@@ -1436,7 +1436,7 @@ fn re_solve_requested_contacts(
 
     for (entity, (index, linear_before, angular_before)) in body_velocity_before {
         if let Some(body) = solver_bodies.get(index) {
-            info!(
+            debug!(
                 "CONTACT_RE_SOLVE_BODY entity={:?} linear_before={:?} linear_after={:?} delta_linear={:?} angular_before={:?} angular_after={:?} delta_angular={:?}",
                 entity,
                 linear_before,
@@ -1447,7 +1447,7 @@ fn re_solve_requested_contacts(
                 body.angular_velocity - angular_before,
             );
         } else {
-            info!("CONTACT_RE_SOLVE_BODY entity={:?} solver_body=missing", entity);
+            debug!("CONTACT_RE_SOLVE_BODY entity={:?} solver_body=missing", entity);
         }
     }
 }
