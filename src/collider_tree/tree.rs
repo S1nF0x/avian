@@ -32,6 +32,9 @@ pub struct ColliderTree {
     pub moved_proxies: MovedProxyList,
     /// A workspace for reusing allocations across tree operations.
     pub workspace: ColliderTreeWorkspace,
+    /// Changes whenever the live BVH has a new topology or bounding box.
+    /// Background optimization snapshots must not overwrite newer geometry.
+    pub mutation_revision: u64,
 }
 
 /// A set of [`ProxyId`]s that have moved since the last update, in insertion order.
@@ -224,6 +227,7 @@ impl ColliderTree {
 
         // Insert the proxy into the BVH.
         self.bvh.insert_primitive(aabb, id);
+        self.mutation_revision = self.mutation_revision.wrapping_add(1);
 
         // Add to moved proxies.
         self.moved_proxies.push(ProxyId::new(id));
@@ -239,6 +243,7 @@ impl ColliderTree {
         if let Some(proxy) = self.proxies.try_remove(proxy_id.index()) {
             // Remove from the BVH.
             self.bvh.remove_primitive(proxy_id.id());
+            self.mutation_revision = self.mutation_revision.wrapping_add(1);
 
             // Remove from moved proxies.
             self.moved_proxies.remove(proxy_id);
@@ -321,6 +326,7 @@ impl ColliderTree {
 
         // Update the proxy's AABB in the BVH.
         self.bvh.nodes[node_index].set_aabb(aabb);
+        self.mutation_revision = self.mutation_revision.wrapping_add(1);
     }
 
     /// Resizes the AABB of a proxy in the tree.
@@ -334,6 +340,7 @@ impl ColliderTree {
     pub fn resize_proxy_aabb(&mut self, proxy_id: ProxyId, aabb: Aabb) {
         let node_index = self.bvh.primitives_to_nodes[proxy_id.index()] as usize;
         self.bvh.resize_node(node_index, aabb);
+        self.mutation_revision = self.mutation_revision.wrapping_add(1);
     }
 
     /// Updates the AABB of a proxy and reinserts it at an optimal place in the tree.
@@ -343,12 +350,14 @@ impl ColliderTree {
         let node_id = self.bvh.primitives_to_nodes[proxy_id.index()];
         self.bvh.resize_node(node_id as usize, aabb);
         self.bvh.reinsert_node(node_id as usize);
+        self.mutation_revision = self.mutation_revision.wrapping_add(1);
     }
 
     /// Refits the entire tree from the leaves up.
     #[inline]
     pub fn refit_all(&mut self) {
         self.bvh.refit_all();
+        self.mutation_revision = self.mutation_revision.wrapping_add(1);
     }
 
     /// Fully rebuilds the tree from the given list of AABBs.
@@ -360,6 +369,7 @@ impl ColliderTree {
             SortPrecision::U64,
             0,
         );
+        self.mutation_revision = self.mutation_revision.wrapping_add(1);
     }
 
     /// Rebuilds parts of the tree corresponding to the given list of leaf node indices.
@@ -377,6 +387,7 @@ impl ColliderTree {
             SortPrecision::U64,
             0,
         );
+        self.mutation_revision = self.mutation_revision.wrapping_add(1);
     }
 
     /// Restructures the tree using parallel reinsertion, optimizing node locations based on SAH cost.
@@ -388,6 +399,7 @@ impl ColliderTree {
         self.workspace
             .reinsertion_optimizer
             .run(&mut self.bvh, batch_size_ratio, None);
+        self.mutation_revision = self.mutation_revision.wrapping_add(1);
     }
 
     /// Restructures the tree using parallel reinsertion, optimizing node locations based on SAH cost.
@@ -400,5 +412,6 @@ impl ColliderTree {
             candidates,
             iterations,
         );
+        self.mutation_revision = self.mutation_revision.wrapping_add(1);
     }
 }

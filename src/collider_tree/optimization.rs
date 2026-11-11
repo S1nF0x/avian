@@ -177,6 +177,8 @@ struct OptimizationJob {
     tree_type: ColliderTreeType,
     /// The resolved optimization strategy.
     mode: TreeOptimizationMode,
+    /// Live BVH revision when the optimization snapshot was captured.
+    source_revision: u64,
     /// Whether the optimization has been claimed by a thread.
     claimed: AtomicBool,
 }
@@ -264,12 +266,14 @@ fn optimize_trees(
                 // These are not needed during the simulation step.
                 moved_proxies: core::mem::take(&mut tree.moved_proxies),
                 workspace: core::mem::take(&mut tree.workspace),
+                mutation_revision: tree.mutation_revision,
             };
 
             optimization_tasks.jobs.push(Arc::new(OptimizationJob {
                 tree: Mutex::new(new_tree),
                 tree_type,
                 mode: optimization_strategy,
+                source_revision: tree.mutation_revision,
                 claimed: AtomicBool::new(false),
             }));
         }
@@ -323,6 +327,33 @@ fn optimize_tree_in_place(tree: &mut ColliderTree, optimization_strategy: TreeOp
     }
 }
 
+/// Merge only if no collider BVH mutation occurred after optimization began.
+/// Material fracture can replace colliders during a solver step while the
+/// optimizer runs on a cloned BVH. Publishing that stale clone discards live
+/// proxy-to-node entries, causing out-of-bounds updates in the next step.
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "unknown")))]
+fn merge_optimized_tree(
+    live: &mut ColliderTree,
+    optimized: &mut ColliderTree,
+    source_revision: u64,
+) -> bool {
+    let is_current = live.mutation_revision == source_revision;
+    if is_current {
+        live.bvh = core::mem::take(&mut optimized.bvh);
+    } else {
+        // Preserve the authoritative live BVH and reconsider the old
+        // optimization candidates next step, skipping proxies since removed.
+        // In-step changes are already recorded by the live tree.
+        for id in optimized.moved_proxies.iter().copied() {
+            if live.get_proxy(id).is_some() {
+                live.moved_proxies.push(id);
+            }
+        }
+    }
+    live.workspace = core::mem::take(&mut optimized.workspace);
+    is_current
+}
+
 /// Completes the [`ColliderTree`] optimization jobs started in [`optimize_trees`].
 #[cfg(all(not(target_arch = "wasm32"), not(target_os = "unknown")))]
 fn finish_optimize_trees(
@@ -357,9 +388,38 @@ fn finish_optimize_trees(
     for job in jobs {
         let mut tree = job.tree.lock().unwrap_or_else(|err| err.into_inner());
         let collider_tree = collider_trees.tree_for_type_mut(job.tree_type);
-        collider_tree.bvh = core::mem::take(&mut tree.bvh);
-        collider_tree.workspace = core::mem::take(&mut tree.workspace);
+        merge_optimized_tree(collider_tree, &mut tree, job.source_revision);
     }
 
     diagnostics.optimize += start.elapsed();
+}
+
+#[cfg(all(test, not(target_arch = "wasm32"), not(target_os = "unknown")))]
+mod optimization_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn stale_async_bvh_cannot_replace_updated_proxy_mapping() {
+        let mut live = ColliderTree::default();
+        let mut optimized = ColliderTree::default();
+        live.mutation_revision = 2;
+        live.bvh.primitives_to_nodes = vec![0, 1];
+        optimized.bvh.primitives_to_nodes = vec![0];
+
+        assert!(!merge_optimized_tree(&mut live, &mut optimized, 1));
+        assert_eq!(live.bvh.primitives_to_nodes, vec![0, 1]);
+        assert_eq!(live.mutation_revision, 2);
+    }
+
+    #[test]
+    fn unchanged_async_bvh_is_committed() {
+        let mut live = ColliderTree::default();
+        let mut optimized = ColliderTree::default();
+        live.mutation_revision = 1;
+        live.bvh.primitives_to_nodes = vec![0];
+        optimized.bvh.primitives_to_nodes = vec![1];
+
+        assert!(merge_optimized_tree(&mut live, &mut optimized, 1));
+        assert_eq!(live.bvh.primitives_to_nodes, vec![1]);
+    }
 }
