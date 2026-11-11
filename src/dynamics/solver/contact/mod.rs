@@ -22,24 +22,22 @@ use super::solver_body::{SolverBody, SolverBodyIndex, SolverBodyInertia};
 #[inline]
 fn warm_start_tangent_impulse(
     cached: TangentImpulse,
-    coefficient: f32,
     friction: f32,
-    applied_normal_impulse: f32,
+    accumulated_normal_impulse: f32,
     limited: bool,
 ) -> TangentImpulse {
-    let impulse = coefficient * cached;
     if !limited {
-        return impulse;
+        return cached;
     }
 
-    let limit = friction.max(0.0) * applied_normal_impulse;
+    let limit = friction.max(0.0) * accumulated_normal_impulse;
     #[cfg(feature = "2d")]
     {
-        impulse.clamp(-limit, limit)
+        cached.clamp(-limit, limit)
     }
     #[cfg(feature = "3d")]
     {
-        impulse.clamp_length_max(limit)
+        cached.clamp_length_max(limit)
     }
 }
 
@@ -287,20 +285,23 @@ impl ContactConstraint {
             let normal_impulse = point.normal_part.warm_start_impulse(warm_start_coefficient);
             let tangent_impulse = warm_start_tangent_impulse(
                 point.tangent_part.as_ref().map_or(default(), |part| part.impulse),
-                warm_start_coefficient,
                 self.friction,
-                normal_impulse,
+                point.normal_part.impulse,
                 point.normal_part.max_impulse.is_finite(),
             );
+            if let Some(tangent_part) = point.tangent_part.as_mut() {
+                tangent_part.impulse = tangent_impulse;
+            }
+            let applied_tangent_impulse = warm_start_coefficient * tangent_impulse;
             point.substep_applied_normal_impulse += normal_impulse;
-            point.substep_applied_tangent_impulse += tangent_impulse;
+            point.substep_applied_tangent_impulse += applied_tangent_impulse;
 
             #[cfg(feature = "2d")]
-            let p = normal_impulse * self.normal + tangent_impulse * tangent_directions[0];
+            let p = normal_impulse * self.normal + applied_tangent_impulse * tangent_directions[0];
             #[cfg(feature = "3d")]
             let p = normal_impulse * self.normal
-                + tangent_impulse.x * tangent_directions[0]
-                + tangent_impulse.y * tangent_directions[1];
+                + applied_tangent_impulse.x * tangent_directions[0]
+                + applied_tangent_impulse.y * tangent_directions[1];
 
             body1.linear_velocity -= p * inv_mass1;
             body1.angular_velocity -= inv_angular_inertia1 * cross(r1, p);
