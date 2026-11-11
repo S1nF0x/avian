@@ -188,9 +188,6 @@ impl Plugin for SolverPlugin {
             emit_contact_break_events.in_set(ContactBreakageSystems::Detect),
         );
         substeps.add_systems(
-            rollback_requested_contact_impulses.in_set(ContactBreakageSystems::Rollback),
-        );
-        substeps.add_systems(
             apply_contact_status_changes.in_set(ContactBreakageSystems::Rebuild),
         );
         substeps.add_systems(
@@ -641,43 +638,15 @@ impl Default for SolverConfig {
 pub struct ContactReseolveQueue {
     pending: Vec<ContactId>,
     prepared_contacts: Option<Vec<ContactId>>,
-    impulse_retention: HashMap<ContactId, f32>,
 }
 
 impl ContactReseolveQueue {
-    /// Requests contacts for rollback and one local re-solve.
+    /// Requests contacts for one local final solve after a geometry transaction.
     pub fn request_contacts(
         &mut self,
         contact_ids: impl IntoIterator<Item = ContactId>,
     ) {
         self.pending.extend(contact_ids);
-    }
-
-    /// Requests a contact rebuild with a precomputed fraction of the applied
-    /// impulse retained. Material failure and energy accounting belong to the
-    /// caller; the solver only applies this scalar to its impulse ledger.
-    pub fn request_impulse_retention(
-        &mut self,
-        contact_id: ContactId,
-        retained_fraction: f32,
-    ) -> f32 {
-        if !retained_fraction.is_finite() {
-            return 1.0;
-        }
-
-        let retained_fraction = retained_fraction.clamp(0.0, 1.0);
-        self.request_contacts([contact_id]);
-        let stored = self
-            .impulse_retention
-            .entry(contact_id)
-            .and_modify(|current| *current = (*current).min(retained_fraction))
-            .or_insert(retained_fraction);
-        *stored
-    }
-
-    /// Returns the precomputed impulse fraction for a refreshed contact pair.
-    pub(crate) fn retained_impulse_fraction(&self, contact_id: ContactId) -> Option<f32> {
-        self.impulse_retention.get(&contact_id).copied()
     }
 
     /// Whether topology publication requires the standard collider refresh pipeline.
@@ -690,18 +659,6 @@ impl ContactReseolveQueue {
         self.prepared_contacts.is_some()
     }
 
-    /// Returns requested old constraints. The rollback stage reverses an
-    /// impulse only if refreshed geometry provides a replacement manifold;
-    /// impulses from contacts that fully disappeared remain committed.
-    pub(crate) fn contacts_for_rollback(&mut self) -> Option<Vec<ContactId>> {
-        if self.pending.is_empty() {
-            return None;
-        }
-        self.pending.sort_unstable();
-        self.pending.dedup();
-        Some(self.pending.clone())
-    }
-
     fn take_for_rebuild(&mut self) -> Option<Vec<ContactId>> {
         if self.pending.is_empty() {
             return None;
@@ -710,7 +667,6 @@ impl ContactReseolveQueue {
         self.pending.dedup();
         let requested = core::mem::take(&mut self.pending);
         self.prepared_contacts = Some(requested.clone());
-        self.impulse_retention.clear();
         Some(requested)
     }
 
@@ -726,7 +682,6 @@ impl ContactReseolveQueue {
     fn clear_pending(&mut self) {
         self.pending.clear();
         self.prepared_contacts = None;
-        self.impulse_retention.clear();
     }
 }
 
@@ -974,227 +929,6 @@ fn prepare_contact_constraints_internal(
         .sum::<usize>() as u32;
 }
 
-/// Returns whether a refreshed pair has a replacement solver manifold for
-/// the same rigid-body pair as an old constraint. A contact ID can be retired
-/// and reused during topology refresh, so identity alone is not sufficient.
-fn has_replacement_solver_manifold(
-    pair: Option<&ContactPair>,
-    body_entity1: Option<Entity>,
-    body_entity2: Option<Entity>,
-    manifold_index: usize,
-) -> bool {
-    pair.is_some_and(|pair| {
-        pair.is_touching()
-            && pair.generates_constraints()
-            && pair.body1 == body_entity1
-            && pair.body2 == body_entity2
-            && pair
-                .manifolds
-                .get(manifold_index)
-                .is_some_and(|manifold| !manifold.points.is_empty())
-    })
-}
-
-/// Reverses affected impulses only when refreshed geometry still has a
-/// replacement solver manifold for that same body pair.
-///
-/// If fracture removes the entire contact surface, the old impulse is already
-/// a real momentum exchange in this substep. Reversing it with no replacement
-/// constraint would erase the impact from both bodies. Such impulses remain
-/// committed; surviving contacts are rolled back and re-solved against the
-/// refreshed geometry.
-///
-/// A topology publication may despawn a body; Avian's removal observer
-/// swap-removes its solver body immediately. Resolve both indices by entity so
-/// a stale slot is never applied to the swapped body.
-fn rollback_requested_contact_impulses(
-    contact_graph: Res<ContactGraph>,
-    mut solver_bodies: ResMut<SolverBodies>,
-    mut constraint_graph: ResMut<ConstraintGraph>,
-    mut re_solve_queue: ResMut<ContactReseolveQueue>,
-    body_indices: Query<&SolverBodyIndex>,
-) {
-    let Some(requested_contacts) = re_solve_queue.contacts_for_rollback() else {
-        return;
-    };
-
-    // Snapshot the affected bodies before changing any impulse. This makes
-    // the rollback result independently observable from the subsequent re-solve.
-    let mut body_velocity_before = HashMap::<Entity, (Vector, Vector)>::new();
-    for color in &constraint_graph.colors {
-        for constraint in &color.contact_constraints {
-            if requested_contacts.binary_search(&constraint.contact_id).is_err() {
-                continue;
-            }
-            for entity in [constraint.body_entity1, constraint.body_entity2]
-                .into_iter()
-                .flatten()
-            {
-                let Some(index) = body_indices.get(entity).ok().copied() else {
-                    continue;
-                };
-                if let Some(body) = solver_bodies.get(index) {
-                    body_velocity_before.entry(entity).or_insert((
-                        body.linear_velocity,
-                        body.angular_velocity,
-                    ));
-                }
-            }
-        }
-    }
-
-    let access = solver_bodies.access();
-    let mut matched_constraints = 0usize;
-    let mut matched_points = 0usize;
-    let mut applied_normal_impulse_ns = 0.0_f64;
-    let mut retained_normal_impulse_ns = 0.0_f64;
-    let mut replacement_manifolds = 0usize;
-    let mut vanished_manifolds = 0usize;
-
-    for color in &mut constraint_graph.colors {
-        for constraint in &mut color.contact_constraints {
-            if requested_contacts.binary_search(&constraint.contact_id).is_err() {
-                continue;
-            }
-            matched_constraints += 1;
-            matched_points += constraint.points.len();
-
-            let normal_impulse_ns = constraint
-                .points
-                .iter()
-                .map(|point| f64::from(point.substep_applied_impulses().0.max(0.0)))
-                .sum::<f64>();
-            let retained_fraction =
-                re_solve_queue.retained_impulse_fraction(constraint.contact_id);
-
-            // A topology publication can despawn a body and make Avian
-            // swap-remove another body's solver slot. Refresh both indices
-            // BEFORE either the partial-retention or full-rollback operation.
-            constraint.body_index1 = constraint
-                .body_entity1
-                .and_then(|entity| body_indices.get(entity).ok().copied())
-                .unwrap_or(SolverBodyIndex::INVALID);
-            constraint.body_index2 = constraint
-                .body_entity2
-                .and_then(|entity| body_indices.get(entity).ok().copied())
-                .unwrap_or(SolverBodyIndex::INVALID);
-
-            if let Some(fraction) = retained_fraction {
-                constraint.commit_substep_impulse_fraction(fraction, &access);
-                applied_normal_impulse_ns += normal_impulse_ns;
-                retained_normal_impulse_ns += normal_impulse_ns * f64::from(fraction);
-            }
-
-            let replacement = contact_graph
-                .get_by_id(constraint.contact_id)
-                .map(|(_, pair)| pair);
-            let has_replacement = has_replacement_solver_manifold(
-                replacement,
-                constraint.body_entity1,
-                constraint.body_entity2,
-                constraint.manifold_index,
-            );
-
-            if !has_replacement {
-                vanished_manifolds += 1;
-                let normal_speed_min = constraint
-                    .points
-                    .iter()
-                    .map(|point| point.normal_speed)
-                    .fold(f32::INFINITY, f32::min);
-                let normal_speed_max = constraint
-                    .points
-                    .iter()
-                    .map(|point| point.normal_speed)
-                    .fold(f32::NEG_INFINITY, f32::max);
-                debug!(
-                    "CONTACT_IMPULSE_ROLLBACK contact_id={:?} manifold={} body1={:?} body2={:?} normal={:?} normal_speed_min={:.4} normal_speed_max={:.4} points={} normal_impulse_ns={:.3} retained_fraction={} replacement=false",
-                    constraint.contact_id,
-                    constraint.manifold_index,
-                    constraint.body_entity1,
-                    constraint.body_entity2,
-                    constraint.normal,
-                    normal_speed_min,
-                    normal_speed_max,
-                    constraint.points.len(),
-                    normal_impulse_ns,
-                    retained_fraction.map_or_else(|| "none".to_owned(), |value| format!("{value:.6}")),
-                );
-                // No replacement contact means the retained impulse is the
-                // only record of this impact. Keep it committed.
-                continue;
-            }
-
-            replacement_manifolds += 1;
-            let normal_speed_min = constraint
-                .points
-                .iter()
-                .map(|point| point.normal_speed)
-                .fold(f32::INFINITY, f32::min);
-            let normal_speed_max = constraint
-                .points
-                .iter()
-                .map(|point| point.normal_speed)
-                .fold(f32::NEG_INFINITY, f32::max);
-            constraint.rollback_substep_impulses(&access);
-            debug!(
-                "CONTACT_IMPULSE_ROLLBACK contact_id={:?} manifold={} body1={:?} body2={:?} normal={:?} normal_speed_min={:.4} normal_speed_max={:.4} points={} normal_impulse_ns={:.3} retained_fraction={} replacement=true",
-                constraint.contact_id,
-                constraint.manifold_index,
-                constraint.body_entity1,
-                constraint.body_entity2,
-                constraint.normal,
-                normal_speed_min,
-                normal_speed_max,
-                constraint.points.len(),
-                normal_impulse_ns,
-                retained_fraction.map_or_else(|| "none".to_owned(), |value| format!("{value:.6}")),
-            );
-        }
-    }
-
-    drop(access);
-    for (entity, (linear_before, angular_before)) in body_velocity_before {
-        let after = body_indices
-            .get(entity)
-            .ok()
-            .copied()
-            .and_then(|index| solver_bodies.get(index));
-        if let Some(body) = after {
-            debug!(
-                "CONTACT_ROLLBACK_BODY entity={:?} linear_before={:?} linear_after={:?} delta_linear={:?} angular_before={:?} angular_after={:?} delta_angular={:?}",
-                entity,
-                linear_before,
-                body.linear_velocity,
-                body.linear_velocity - linear_before,
-                angular_before,
-                body.angular_velocity,
-                body.angular_velocity - angular_before,
-            );
-        } else {
-            debug!("CONTACT_ROLLBACK_BODY entity={:?} solver_body=missing", entity);
-        }
-    }
-
-    if matched_constraints == 0 {
-        info!(
-            "CONTACT_IMPULSE_ROLLBACK_STAGE requested_contacts={} matched_constraints=0",
-            requested_contacts.len(),
-        );
-    } else {
-        info!(
-            "CONTACT_IMPULSE_ROLLBACK_STAGE requested_contacts={} matched_constraints={} matched_points={} applied_normal_impulse_ns={:.3} retained_normal_impulse_ns={:.3} replacement_manifolds={} vanished_manifolds={}",
-            requested_contacts.len(),
-            matched_constraints,
-            matched_points,
-            applied_normal_impulse_ns,
-            retained_normal_impulse_ns,
-            replacement_manifolds,
-            vanished_manifolds,
-        );
-    }
-}
-
 /// Rebuilds only the contact constraints requested by a breakage system.
 /// Constraints outside the requested set retain their already-solved impulses
 /// and are not rebuilt or solved a second time in this substep.
@@ -1218,8 +952,8 @@ fn rebuild_requested_contact_constraints(
     );
 
     // Solver-body indices are refreshed by entity identity after any
-    // fracture-driven body insertion/removal. Impulse rollback already
-    // happened before contact-status changes could prune the old constraints.
+    // fracture-driven body insertion/removal. The owner has restored the
+    // pre-probe state before contact-status changes prune the old constraints.
     for color in &mut constraint_graph.colors {
         for constraint in &mut color.contact_constraints {
             constraint.body_index1 = constraint
@@ -1270,8 +1004,8 @@ fn current_contact_separation(
         + stored_separation_offset
 }
 
-/// Re-solves the rebuilt contact constraints once after a breakage system has
-/// refreshed the affected manifolds. Positions are not integrated a second time.
+/// Performs the final solve on rebuilt contact constraints after a probe-state
+/// restore and geometry refresh. Positions are integrated only once afterward.
 #[allow(clippy::too_many_arguments)]
 fn re_solve_requested_contacts(
     mut solver_bodies: ResMut<SolverBodies>,
@@ -1332,25 +1066,63 @@ fn re_solve_requested_contacts(
     let max_overlap_solve_speed = solver_config.max_overlap_solve_speed * length_unit.0;
     let delta_secs = time.delta_secs();
 
-    // A topology replacement happens after this substep's positions have
-    // already been integrated. Newly discovered contacts can begin deeply
-    // overlapped because voxel cells were converted into separate rigid bodies
-    // at their existing world positions. Applying positional bias a second
-    // time turns that representation overlap into an artificial impact.
-    // Re-solve only physical velocity constraints; do not apply a second
-    // positional-correction pass within the same substep.
-    //
-    // A topology edit can replace one old manifold with several new manifolds
-    // sharing the same impactor. These contacts are born at shared voxel poses
-    // and are already representation-overlapped. Repeating the velocity
-    // projection on that overlap manufactures a rebound impulse, so the
-    // affected island receives one sequential velocity pass after rollback.
-    const LOCAL_RE_SOLVE_ITERATIONS: usize = 1;
-    for _ in 0..LOCAL_RE_SOLVE_ITERATIONS {
-        for constraint in constraint_graph.colors[COLOR_OVERFLOW_INDEX]
-            .contact_constraints
-            .iter_mut()
-        {
+    // The probe result has been discarded by the owner for this dynamic island.
+    // Run the same biased solve and relaxation pair as the normal substep solver,
+    // but only for the refreshed contacts in the affected island. No warm-start
+    // impulse is applied to the rebuilt constraints.
+    for constraint in constraint_graph.colors[COLOR_OVERFLOW_INDEX]
+        .contact_constraints
+        .iter_mut()
+    {
+        if is_requested(constraint.contact_id) {
+            solve_contacts_internal::<true>(
+                &access,
+                constraint,
+                max_overlap_solve_speed,
+                delta_secs,
+            );
+        }
+    }
+
+    for color in constraint_graph
+        .colors
+        .iter_mut()
+        .take(COLOR_OVERFLOW_INDEX)
+        .filter(|color| !color.contact_constraints.is_empty())
+    {
+        crate::utils::par_for_each(&mut color.contact_constraints, 64, |_i, constraint| {
+            if is_requested(constraint.contact_id) {
+                solve_contacts_internal::<true>(
+                    &access,
+                    constraint,
+                    max_overlap_solve_speed,
+                    delta_secs,
+                );
+            }
+        });
+    }
+
+    for constraint in constraint_graph.colors[COLOR_OVERFLOW_INDEX]
+        .contact_constraints
+        .iter_mut()
+    {
+        if is_requested(constraint.contact_id) {
+            solve_contacts_internal::<false>(
+                &access,
+                constraint,
+                max_overlap_solve_speed,
+                delta_secs,
+            );
+        }
+    }
+
+    for color in constraint_graph
+        .colors
+        .iter_mut()
+        .take(COLOR_OVERFLOW_INDEX)
+        .filter(|color| !color.contact_constraints.is_empty())
+    {
+        crate::utils::par_for_each(&mut color.contact_constraints, 64, |_i, constraint| {
             if is_requested(constraint.contact_id) {
                 solve_contacts_internal::<false>(
                     &access,
@@ -1359,25 +1131,7 @@ fn re_solve_requested_contacts(
                     delta_secs,
                 );
             }
-        }
-
-        for color in constraint_graph
-            .colors
-            .iter_mut()
-            .take(COLOR_OVERFLOW_INDEX)
-            .filter(|color| !color.contact_constraints.is_empty())
-        {
-            crate::utils::par_for_each(&mut color.contact_constraints, 64, |_i, constraint| {
-                if is_requested(constraint.contact_id) {
-                    solve_contacts_internal::<false>(
-                        &access,
-                        constraint,
-                        max_overlap_solve_speed,
-                        delta_secs,
-                    );
-                }
-            });
-        }
+        });
     }
 
     drop(access);
@@ -1482,7 +1236,7 @@ fn re_solve_requested_contacts(
     diagnostics.contact_re_solve_count += 1;
     diagnostics.contact_re_solve += start.elapsed();
     info!(
-        "CONTACT_RE_SOLVE_STAGE requested_contacts={} solved_constraints={} re_solve_normal_impulse_ns={:.3} elapsed_ms={:.3}",
+        "FINAL_SOLVE_STAGE requested_contacts={} solved_constraints={} re_solve_normal_impulse_ns={:.3} elapsed_ms={:.3}",
         requested_contacts.len(),
         solved_constraints,
         re_solve_normal_impulse_ns,
@@ -2035,33 +1789,10 @@ mod contact_re_solve_tests {
     }
 
     #[test]
-    fn queue_stores_a_precomputed_retention_fraction() {
-        let mut queue = ContactReseolveQueue::default();
-        let fraction = queue.request_impulse_retention(ContactId(5), 0.25);
-
-        assert_eq!(fraction, 0.25);
-        assert_eq!(queue.retained_impulse_fraction(ContactId(5)), Some(0.25));
-        assert!(queue.pending.contains(&ContactId(5)));
-    }
-
-    #[test]
-    fn repeated_retention_requests_keep_the_most_conservative_fraction() {
-        let mut queue = ContactReseolveQueue::default();
-        queue.request_impulse_retention(ContactId(5), 0.8);
-        let fraction = queue.request_impulse_retention(ContactId(5), 0.3);
-
-        assert_eq!(fraction, 0.3);
-        assert_eq!(queue.retained_impulse_fraction(ContactId(5)), Some(0.3));
-    }
-
-    #[test]
-    fn a_new_substep_discards_an_unconsumed_transaction() {
+    fn new_substep_discards_an_unconsumed_transaction() {
         let mut queue = ContactReseolveQueue::default();
         queue.request_contacts([ContactId(3), ContactId(8)]);
-        assert_eq!(
-            queue.contacts_for_rollback(),
-            Some(vec![ContactId(3), ContactId(8)]),
-        );
+        assert!(queue.has_pending_rebuild());
 
         queue.begin_substep();
 
@@ -2070,50 +1801,23 @@ mod contact_re_solve_tests {
     }
 
     #[test]
-    fn rollback_and_re_solve_share_one_sorted_deduplicated_batch() {
+    fn final_solve_batch_is_sorted_and_deduplicated() {
         let mut queue = ContactReseolveQueue::default();
         queue.request_contacts([ContactId(9), ContactId(2), ContactId(9)]);
-
-        let expected = vec![ContactId(2), ContactId(9)];
-        assert_eq!(queue.contacts_for_rollback(), Some(expected.clone()));
-        assert_eq!(queue.take_for_rebuild(), Some(expected.clone()));
-        assert_eq!(queue.take_prepared_contacts(), Some(expected));
-    }
-
-    #[test]
-    fn contacts_discovered_after_rollback_join_the_same_re_solve() {
-        let mut queue = ContactReseolveQueue::default();
-        queue.request_contacts([ContactId(12), ContactId(18)]);
-
-        assert_eq!(
-            queue.contacts_for_rollback(),
-            Some(vec![ContactId(12), ContactId(18)]),
-        );
-
-        queue.request_contacts([ContactId(30), ContactId(7), ContactId(12)]);
+        queue.request_contacts([ContactId(30), ContactId(7), ContactId(2)]);
 
         let expected = vec![
+            ContactId(2),
             ContactId(7),
-            ContactId(12),
-            ContactId(18),
+            ContactId(9),
             ContactId(30),
         ];
         assert_eq!(queue.take_for_rebuild(), Some(expected.clone()));
         assert_eq!(queue.take_prepared_contacts(), Some(expected));
-    }
-
-    #[test]
-    fn consumed_transaction_leaves_no_pending_contacts() {
-        let mut queue = ContactReseolveQueue::default();
-        queue.request_contacts([ContactId(3), ContactId(8)]);
-        assert!(queue.has_pending_rebuild());
-        queue.contacts_for_rollback();
-        queue.take_for_rebuild();
-        queue.take_prepared_contacts();
-
         assert!(!queue.has_pending_rebuild());
         assert!(!queue.has_prepared_re_solve());
     }
+
 }
 
 /// Inverts a summed inverse inertia on its non-zero axes, so a locked axis doesn't zero the whole inverse.

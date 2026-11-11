@@ -69,7 +69,7 @@ impl Plugin for SolverSchedulePlugin {
                         ContactBreakageSystems::RefreshBroadPhase,
                         ContactBreakageSystems::RefreshNarrowPhase,
                         ContactBreakageSystems::RefreshContacts,
-                        ContactBreakageSystems::Rollback,
+                        ContactBreakageSystems::RestoreProbeState,
                         ContactBreakageSystems::Rebuild,
                         ContactBreakageSystems::PrepareBodies,
                         ContactBreakageSystems::PrepareSolverBodies,
@@ -145,13 +145,13 @@ pub type SolverSet = SolverSystems;
 /// 2. Warm start ([`SubstepSolverSystems::WarmStart`])
 /// 3. Solve constraints with bias ([`SubstepSolverSystems::SolveConstraints`])
 /// 4. Solve constraints without bias to relax velocities ([`SubstepSolverSystems::Relax`])
-/// 5. Detect and publish material topology changes ([`ContactBreakageSystems::Detect`] and
-///    [`ContactBreakageSystems::Apply`])
-/// 6. Rebase affected solver poses, then refresh collider AABBs, broad-phase pairs, and manifolds
-/// 7. Roll back impulses only for old manifolds that still have replacements; keep impulses
-///    from vanished manifolds, update solver bodies, rebuild constraints, and perform one re-solve
+/// 5. Probe the complete contact geometry, then publish material topology changes
+///    ([`ContactBreakageSystems::Detect`] and [`ContactBreakageSystems::Apply`])
+/// 6. Refresh collider AABBs, broad-phase pairs, and narrow-phase manifolds
+/// 7. Restore the pre-probe state of affected dynamic islands, rebuild their contact
+///    constraints without warm starting, and perform one final local solve
 /// 8. Apply velocity-based constraint damping ([`SubstepSolverSystems::Damping`])
-/// 9. Integrate positions ([`IntegrationSystems::Position`])
+/// 9. Integrate positions once ([`IntegrationSystems::Position`])
 #[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SubstepSolverSystems {
     /// Warm starts the solver by applying the impulses from the previous frame or substep.
@@ -172,16 +172,14 @@ pub enum SubstepSolverSystems {
 
 /// Extension points for material breakage and same-substep contact rebuilding.
 ///
-/// The [`Detect`](Self::Detect) set emits [`ContactBreakEvent`] messages after
-/// the normal relaxation pass. Applications publish authoritative material and
-/// collider changes in [`Apply`](Self::Apply). The owner may rebase affected
-/// bodies to their current substep poses. Avian then refreshes collider AABBs,
-/// broad-phase pairs, and narrow-phase manifolds. It rolls back only old manifold
-/// impulses that have a replacement on the same body pair; impulses from fully
-/// vanished manifolds remain committed as momentum exchange. PrepareBodies lets the
-/// owner transfer the resulting rigid velocity to its new fragments. Avian updates
-/// solver bodies, rebuilds only requested constraints, and exposes
-/// [`PrepareReSolve`](Self::PrepareReSolve) before the single [`ReSolve`](Self::ReSolve).
+/// The [`Detect`](Self::Detect) set runs after the complete probe solve. Applications
+/// use [`Apply`](Self::Apply) to publish authoritative material and collider changes.
+/// Avian refreshes collider AABBs, broad-phase pairs, and narrow-phase manifolds.
+/// The owner restores the pre-probe solver state of affected dynamic islands in
+/// [`RestoreProbeState`](Self::RestoreProbeState). Avian then applies contact-status
+/// changes, prepares new solver bodies, rebuilds only requested constraints without
+/// warm-start impulses, and exposes [`PrepareReSolve`](Self::PrepareReSolve) before
+/// one final local solve in [`ReSolve`](Self::ReSolve).
 #[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ContactBreakageSystems {
     /// Emits contact capacity failures detected by the solver.
@@ -196,9 +194,8 @@ pub enum ContactBreakageSystems {
     RefreshNarrowPhase,
     /// Lets the material owner request the affected dynamic contact island.
     RefreshContacts,
-    /// Reverses current-substep impulses only for contacts with replacement
-    /// manifolds in the affected dynamic contact island.
-    Rollback,
+    /// Lets the owner restore pre-probe solver state for affected dynamic islands.
+    RestoreProbeState,
     /// Applies queued contact status changes and retires old constraints.
     Rebuild,
     /// Extension point for transferring source-body motion to newly created fragments.
