@@ -764,6 +764,8 @@ fn solve_continuous(
 
         // Details of the earliest impact found across all of the body's colliders.
         let mut best_impact: Option<CcdImpact> = None;
+        let mut voxel_sweeps = 0_usize;
+        let mut voxel_candidates = 0_usize;
 
         // Sweep each collider attached to the body.
         for collider_entity in fast.colliders {
@@ -777,6 +779,9 @@ fn solve_continuous(
             };
 
             let shape1 = collider1.shape_scaled().as_ref();
+            if shape1.as_voxels().is_some() {
+                voxel_sweeps += 1;
+            }
 
             // Voxel colliders use the rotation-aware sparse TOI path in compute_ccd_toi.
             // Do not bypass them: excluding them here also gives them infinite CCD thickness.
@@ -869,6 +874,9 @@ fn solve_continuous(
                     let target_shape = collider2.shape_scaled();
                     let voxel_pair =
                         shape1.as_voxels().is_some() || target_shape.as_ref().as_voxels().is_some();
+                    if voxel_pair {
+                        voxel_candidates += 1;
+                    }
                     if !voxel_pair
                         && contact_graph
                             .get(collider_entity, collider_entity2)
@@ -974,6 +982,24 @@ fn solve_continuous(
 
                     true
                 });
+            }
+        }
+
+        // The default log level stays quiet on ordinary rigid bodies. This exposes
+        // the distinction between no broad-phase candidates and a failed TOI
+        // without requiring another special-purpose debug scene.
+        if voxel_sweeps != 0 {
+            if let Some(impact) = best_impact {
+                info!(
+                    "VOXEL_CCD_HIT body={:?} target={:?} speed_m_s={:.3} swept_distance_m={:.3} toi_s={:.7} fraction={:.7} candidates={}",
+                    fast.entity, impact.collider2, lin_speed, max_motion, min_toi,
+                    min_toi * inv_dt, voxel_candidates,
+                );
+            } else {
+                debug!(
+                    "VOXEL_CCD_MISS body={:?} speed_m_s={:.3} swept_distance_m={:.3} candidates={} ccd_thickness_m={:.4}",
+                    fast.entity, lin_speed, max_motion, voxel_candidates, ccd_thickness,
+                );
             }
         }
 
