@@ -1198,7 +1198,10 @@ fn compute_ccd_toi(
     // Parry's built-in voxel nonlinear cast freezes the voxel body's rotation and
     // propagates only a translational search frontier. Use a rotation-aware sparse
     // candidate query here, then cast the candidate voxel cuboids with full rigid motion.
-    if mode == SweepMode::NonLinear {
+    // The dedicated sparse voxel dispatch is required in BOTH sweep modes.
+    // A linear-only request must not silently fall through to a composite
+    // query that cannot account for all voxel/voxel configurations.
+    {
         let voxels1 = fast.shape.as_voxels();
         let voxels2 = shape2.as_voxels();
 
@@ -1372,6 +1375,59 @@ fn compute_ccd_toi(
 }
 
 
+/// Returns the first positive cuboid contact time for two rigid motions.
+#[cfg(any(feature = "parry-f32", feature = "parry-f64"))]
+fn cast_voxel_cuboid_toi(
+    motion1: &NonlinearRigidMotion,
+    shape1: &dyn parry::shape::Shape,
+    motion2: &NonlinearRigidMotion,
+    shape2: &dyn parry::shape::Shape,
+    max_toi: f32,
+) -> Option<f32> {
+    if max_toi <= 0.0 {
+        return None;
+    }
+
+    #[cfg(feature = "2d")]
+    let no_rotation = motion1.angvel == 0.0 && motion2.angvel == 0.0;
+    #[cfg(feature = "3d")]
+    let no_rotation =
+        motion1.angvel.length_squared() == 0.0 && motion2.angvel.length_squared() == 0.0;
+
+    let hit = if no_rotation {
+        // A zero-angular-velocity voxel must use the translational Parry cast:
+        // its swept cuboids have exact straight paths even at extreme speeds.
+        cast_shapes(
+            &motion1.start,
+            motion1.linvel,
+            shape1,
+            &motion2.start,
+            motion2.linvel,
+            shape2,
+            ShapeCastOptions {
+                max_time_of_impact: max_toi.real(),
+                target_distance: 0.0,
+                stop_at_penetration: true,
+                compute_impact_geometry_on_penetration: false,
+            },
+        )
+    } else {
+        cast_shapes_nonlinear(
+            motion1,
+            shape1,
+            motion2,
+            shape2,
+            0.0,
+            max_toi.real(),
+            true,
+        )
+    };
+    hit.ok()
+        .flatten()
+        .map(|hit| hit.time_of_impact.f32())
+        .filter(|toi| *toi > 0.0 && *toi < max_toi && toi.is_finite())
+}
+
 /// Builds a conservative swept AABB of the moving shape in the voxel grid's local frame.
 ///
 /// The moving shape is enclosed by its rotation-invariant bounding sphere. The sphere
@@ -1531,33 +1587,25 @@ fn compute_ccd_voxel_shape_toi(
         }
 
         let candidate_motion = voxel_motion.prepend_translation(voxel.center);
-        let hit = if voxel_is_shape1 {
-            cast_shapes_nonlinear(
+        let toi = if voxel_is_shape1 {
+            cast_voxel_cuboid_toi(
                 &candidate_motion,
                 &voxel_shape,
                 moving_motion,
                 moving_shape,
-                0.0,
-                best_toi.real(),
-                false,
+                best_toi,
             )
         } else {
-            cast_shapes_nonlinear(
+            cast_voxel_cuboid_toi(
                 moving_motion,
                 moving_shape,
                 &candidate_motion,
                 &voxel_shape,
-                0.0,
-                best_toi.real(),
-                false,
+                best_toi,
             )
         };
-
-        if let Some(hit) = hit.ok().flatten() {
-            let toi = hit.time_of_impact.f32();
-            if toi > 0.0 && toi < best_toi {
-                best_toi = toi;
-            }
+        if let Some(toi) = toi {
+            best_toi = toi;
         }
     }
 
@@ -1608,22 +1656,14 @@ fn compute_ccd_voxel_voxel_toi(
                 }
 
                 let target_motion = motion2.prepend_translation(target_voxel.center);
-                if let Some(hit) = cast_shapes_nonlinear(
+                if let Some(toi) = cast_voxel_cuboid_toi(
                     &source_motion,
                     &source_shape,
                     &target_motion,
                     &target_shape,
-                    0.0,
-                    best_toi.real(),
-                    false,
-                )
-                .ok()
-                .flatten()
-                {
-                    let toi = hit.time_of_impact.f32();
-                    if toi > 0.0 && toi < best_toi {
-                        best_toi = toi;
-                    }
+                    best_toi,
+                ) {
+                    best_toi = toi;
                 }
             }
         }
@@ -1651,22 +1691,14 @@ fn compute_ccd_voxel_voxel_toi(
                 }
 
                 let target_motion = motion1.prepend_translation(target_voxel.center);
-                if let Some(hit) = cast_shapes_nonlinear(
+                if let Some(toi) = cast_voxel_cuboid_toi(
                     &target_motion,
                     &target_shape,
                     &source_motion,
                     &source_shape,
-                    0.0,
-                    best_toi.real(),
-                    false,
-                )
-                .ok()
-                .flatten()
-                {
-                    let toi = hit.time_of_impact.f32();
-                    if toi > 0.0 && toi < best_toi {
-                        best_toi = toi;
-                    }
+                    best_toi,
+                ) {
+                    best_toi = toi;
                 }
             }
         }
@@ -1931,6 +1963,53 @@ mod voxel_ccd_tests {
         .expect("multi-turn voxel sweep must find the intermediate 180-degree impact");
 
         assert!(toi > 0.0 && toi < DT * 0.5, "invalid winding TOI: {toi}");
+    }
+
+    #[test]
+    fn complete_voxel_wall_sweep_catches_vehicle_before_deep_overlap() {
+        let mut truck_cells = Vec::new();
+        for y in 4..=5 {
+            for z in -7..=6 {
+                truck_cells.push(IVector::new(11, y, z));
+            }
+        }
+        let mut wall_cells = Vec::new();
+        for x in 0..10 {
+            for y in 4..=5 {
+                for z in 0..24 {
+                    wall_cells.push(IVector::new(x, y, z));
+                }
+            }
+        }
+        let truck = SharedShape::voxels(Vector::splat(0.1), &truck_cells);
+        let wall = SharedShape::voxels(Vector::splat(0.1), &wall_cells);
+        let stationary = NonlinearRigidMotion::constant_position(
+            Pose::translation(0.0, 0.0, -1.2),
+        );
+        for speed in [30.0, 300.0, 3430.0] {
+            let start_x = -1.5;
+            let moving = NonlinearRigidMotion::new(
+                Pose::translation(start_x, 0.0, 0.0),
+                Vector::ZERO,
+                Vector::new(speed, 0.0, 0.0),
+                Vector::ZERO,
+            );
+            for mode in [SweepMode::Linear, SweepMode::NonLinear] {
+                let fast = fast_shape(truck.as_ref());
+                let toi = compute_ccd_toi(
+                    mode, &moving, &fast, &stationary, wall.as_ref(),
+                    DT, DT, 0.005,
+                )
+                .unwrap_or_else(|| panic!(
+                    "full voxel wall missed vehicle sweep at {speed} m/s, mode={mode:?}"
+                ));
+                let x = moving.position_at_time(toi).translation.x;
+                assert!(
+                    x <= -1.15 && toi > 0.0,
+                    "vehicle crossed intact wall before TOI: speed={speed} mode={mode:?} x={x} toi={toi}"
+                );
+            }
+        }
     }
 
     #[test]
