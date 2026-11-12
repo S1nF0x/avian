@@ -1646,7 +1646,7 @@ mod voxel_ccd_tests {
         ));
         assert!((moving_voxels.ccd_thickness() - 0.1).abs() < 1.0e-6);
 
-        for speed in [343.0, 3430.0, 34300.0] {
+        for speed in [343.0, 3430.0, 34300.0, 343000.0] {
             assert_toi(
                 SweepMode::Linear,
                 moving_voxels.as_ref(),
@@ -1671,7 +1671,7 @@ mod voxel_ccd_tests {
         let target_voxels =
             SharedShape::voxels(Vector::splat(0.1), &[IVector::new(0, 0, 0)]);
 
-        for speed in [343.0, 3430.0, 34300.0] {
+        for speed in [343.0, 3430.0, 34300.0, 343000.0] {
             assert_toi(
                 SweepMode::NonLinear,
                 moving_voxels.as_ref(),
@@ -1688,7 +1688,7 @@ mod voxel_ccd_tests {
         let target_voxels =
             SharedShape::voxels(Vector::splat(0.1), &[IVector::new(0, 0, 0)]);
 
-        for speed in [343.0, 3430.0, 34300.0] {
+        for speed in [343.0, 3430.0, 34300.0, 343000.0] {
             assert_toi(
                 SweepMode::NonLinear,
                 moving_cuboid.as_ref(),
@@ -1720,7 +1720,7 @@ mod voxel_ccd_tests {
     fn swept_broadphase_bounds_include_full_rotation_arc() {
         let aabb = conservative_body_swept_aabb(
             crate::math::RVector::ZERO,
-            Vector::ZERO,
+            crate::math::Vector::ZERO,
             1.0,
         );
 
