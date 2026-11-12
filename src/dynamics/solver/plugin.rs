@@ -1195,6 +1195,7 @@ fn inverse_on_free_axes(inv_inertia: SymmetricTensor) -> SymmetricTensor {
 #[cfg(all(test, feature = "3d"))]
 mod fracture_contact_store_tests {
     use super::*;
+    use crate::collision::contact_types::ContactId;
 
     fn empty_constraint(contact_id: ContactId) -> ContactConstraint {
         ContactConstraint {
