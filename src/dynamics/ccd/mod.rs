@@ -595,16 +595,22 @@ struct CcdResult {
 
 /// Details of the earliest time-of-impact for a fast body.
 #[cfg(any(feature = "parry-f32", feature = "parry-f64"))]
+#[derive(Clone, Copy)]
 struct CcdImpact {
     /// The fast body's colliding collider.
     collider1: Entity,
     /// The obstacle's colliding collider.
     collider2: Entity,
+    /// The rigid body attached to the fast collider.
+    body1: Option<Entity>,
+    /// The rigid body attached to the obstacle collider.
+    body2: Option<Entity>,
+    /// Whether either collider has collision events enabled.
+    contact_events: bool,
+    /// Whether either collider has a contact-modification hook.
+    modify_contacts: bool,
     /// Additional speculative distance to request for the discrete solver next timestep,
     /// so that the contact is detected even if the bodies were separated at the TOI impact.
-    ///
-    /// This is typically only relevant for dynamic-dynamic and dynamic-kinematic impacts
-    /// where the final pose of the other shape ended up separated from the TOI impact point.
     distance: f32,
 }
 
@@ -618,7 +624,13 @@ struct CcdImpact {
 #[cfg(any(feature = "parry-f32", feature = "parry-f64"))]
 fn solve_continuous(
     colliders: Query<
-        (&Collider, &Position, &Rotation, Option<&CollisionLayers>),
+        (
+            &Collider,
+            &Position,
+            &Rotation,
+            Option<&CollisionLayers>,
+            &crate::collider_tree::ColliderTreeProxyKey,
+        ),
         Without<ColliderDisabled>,
     >,
     ccd_query: Query<CcdBodyQuery>,
@@ -755,9 +767,12 @@ fn solve_continuous(
 
         // Sweep each collider attached to the body.
         for collider_entity in fast.colliders {
-            let Ok((collider1, &collider_pos1, &collider_rot1, layers1)) =
+            let Ok((collider1, &collider_pos1, &collider_rot1, layers1, proxy_key1)) =
                 colliders.get(collider_entity)
             else {
+                continue;
+            };
+            let Some(proxy1) = trees.get_proxy(*proxy_key1) else {
                 continue;
             };
 
@@ -765,7 +780,12 @@ fn solve_continuous(
 
             // Voxel colliders use the rotation-aware sparse TOI path in compute_ccd_toi.
             // Do not bypass them: excluding them here also gives them infinite CCD thickness.
-            if !crate::collision::collider::shape_supports_sweeps(shape1) {
+            if !crate::collision::collider::shape_supports_sweeps(shape1)
+                || proxy1.is_sensor()
+                || proxy1
+                    .flags
+                    .contains(crate::collider_tree::ColliderTreeProxyFlags::BODY_DISABLED)
+            {
                 continue;
             }
 
@@ -848,7 +868,7 @@ fn solve_continuous(
                     }
 
                     // Fetch the target collider and its start-of-frame pose.
-                    let Ok((collider2, &target_pos, &target_rot, _)) =
+                    let Ok((collider2, &target_pos, &target_rot, _, _)) =
                         colliders.get(collider_entity2)
                     else {
                         return true;
@@ -856,12 +876,25 @@ fn solve_continuous(
 
                     // Reconstruct the target's motion over the timestep.
                     // Bodies with a solver body are awake and moving, everything else is stationary.
-                    let (motion2, mode2) = match proxy.body {
+                    let (motion2, mode2, target_max_motion) = match proxy.body {
                         Some(body2_entity) => match ccd_query.get(body2_entity) {
                             Ok(body2) => {
                                 if let Some(solver_body2) = bodies.get(*body2.index) {
                                     let target_com_world =
                                         body2.position.0 + (body2.rotation * body2.com.0).real();
+                                    let target_linear_speed = solver_body2.linear_velocity.length();
+                                    #[cfg(feature = "2d")]
+                                    let target_angular_speed = solver_body2.angular_velocity.abs();
+                                    #[cfg(feature = "3d")]
+                                    let target_angular_speed = solver_body2.angular_velocity.length();
+                                    let target_max_velocity = target_linear_speed
+                                        + target_angular_speed * body2.size_metrics.sweep_radius;
+                                    let target_max_delta_position = solver_body2.delta_position.length()
+                                        + solver_body2.delta_rotation.chord_length()
+                                            * body2.size_metrics.sweep_radius;
+                                    let target_max_motion = target_max_delta_position
+                                        .max(target_max_velocity * delta_secs);
+
                                     (
                                         collider_sweep_motion(
                                             target_pos.0,
@@ -871,14 +904,27 @@ fn solve_continuous(
                                             inv_dt,
                                         ),
                                         body2.ccd.map_or(SweepMode::NonLinear, |ccd| ccd.mode),
+                                        target_max_motion,
                                     )
                                 } else {
-                                    (static_motion(target_pos.0, target_rot), SweepMode::Linear)
+                                    (
+                                        static_motion(target_pos.0, target_rot),
+                                        SweepMode::Linear,
+                                        0.0,
+                                    )
                                 }
                             }
-                            Err(_) => (static_motion(target_pos.0, target_rot), SweepMode::Linear),
+                            Err(_) => (
+                                static_motion(target_pos.0, target_rot),
+                                SweepMode::Linear,
+                                0.0,
+                            ),
                         },
-                        None => (static_motion(target_pos.0, target_rot), SweepMode::Linear),
+                        None => (
+                            static_motion(target_pos.0, target_rot),
+                            SweepMode::Linear,
+                            0.0,
+                        ),
                     };
 
                     // Use a non-linear sweep unless both bodies opt into linear sweeps.
@@ -905,11 +951,19 @@ fn solve_continuous(
                         best_impact = Some(CcdImpact {
                             collider1: collider_entity,
                             collider2: collider_entity2,
-                            // The additional speculative distance only needs to span the gap
-                            // the fast contact opens. The body's max travel is a safe upper bound
-                            // that the fast-body test already computed. The narrow phase has a more
-                            // elaborate velocity test that decides whether to actually keep the contact.
-                            distance: max_motion,
+                            body1: proxy1.body,
+                            body2: proxy.body,
+                            contact_events: proxy1
+                                .flags
+                                .contains(crate::collider_tree::ColliderTreeProxyFlags::CONTACT_EVENTS)
+                                || proxy
+                                    .flags
+                                    .contains(crate::collider_tree::ColliderTreeProxyFlags::CONTACT_EVENTS),
+                            modify_contacts: proxy1.has_contact_modification()
+                                || proxy.has_contact_modification(),
+                            // Cover the possible post-TOI travel of either body. The narrow
+                            // phase will decide whether the resulting speculative contact is kept.
+                            distance: max_motion.max(target_max_motion),
                         });
                     }
 
@@ -979,10 +1033,40 @@ fn solve_continuous(
             // velocity correction, which also caused significant overlap with other boxes.
             if fraction < 1.0
                 && let Some(impact) = impact
-                && let Some((_edge, pair)) =
-                    contact_graph.get_mut(impact.collider1, impact.collider2)
             {
-                pair.speculative_distance = pair.speculative_distance.max(impact.distance);
+                // A TOI pair may not have existed in the discrete broad phase because its
+                // start-of-step AABBs were separated. Create the edge now so the next
+                // narrow phase can generate a real or speculative contact constraint.
+                let mut edge = crate::collision::contact_types::ContactEdge::new(
+                    impact.collider1,
+                    impact.collider2,
+                );
+                edge.body1 = impact.body1;
+                edge.body2 = impact.body2;
+                edge.flags.set(
+                    crate::collision::contact_types::ContactEdgeFlags::CONTACT_EVENTS,
+                    impact.contact_events,
+                );
+
+                contact_graph.add_edge_with(edge, |pair| {
+                    pair.body1 = impact.body1;
+                    pair.body2 = impact.body2;
+                    pair.flags.set(
+                        crate::collision::contact_types::ContactPairFlags::GENERATE_CONSTRAINTS,
+                        true,
+                    );
+                    pair.flags.set(
+                        crate::collision::contact_types::ContactPairFlags::MODIFY_CONTACTS,
+                        impact.modify_contacts,
+                    );
+                    pair.speculative_distance = impact.distance;
+                });
+
+                if let Some((_edge, pair)) =
+                    contact_graph.get_mut(impact.collider1, impact.collider2)
+                {
+                    pair.speculative_distance = pair.speculative_distance.max(impact.distance);
+                }
             }
         }
     }
