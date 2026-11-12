@@ -739,9 +739,8 @@ fn solve_continuous(
 
             let shape1 = collider1.shape_scaled().as_ref();
 
-            // Parry has native sparse voxel TOI traversal. Do not bypass voxel colliders:
-            // excluding them here also gives them infinite CCD thickness, so they are never
-            // classified as fast bodies and never reach compute_ccd_toi.
+            // Voxel colliders use the rotation-aware sparse TOI path in compute_ccd_toi.
+            // Do not bypass them: excluding them here also gives them infinite CCD thickness.
             if !crate::collision::collider::shape_supports_sweeps(shape1) {
                 continue;
             }
@@ -1246,10 +1245,13 @@ fn swept_shape_aabb_in_voxel_space(
     moving_motion: &NonlinearRigidMotion,
     moving_shape: &dyn parry::shape::Shape,
     end_time: parry::math::Real,
-    voxel_size: parry::math::Vector,
+    voxel_grid: &parry::shape::Voxels,
 ) -> parry::bounding_volume::Aabb {
     use parry::math::{Real, Vector};
 
+    let voxel_size = voxel_grid.voxel_size();
+    let full_grid_aabb =
+        <parry::shape::Voxels as parry::shape::Shape>::compute_local_aabb(voxel_grid);
     let sphere = moving_shape.compute_local_bounding_sphere();
     let shape_radius = sphere.radius()
         + (sphere.center() - moving_motion.local_center).length();
@@ -1270,17 +1272,13 @@ fn swept_shape_aabb_in_voxel_space(
     let curvature_bound = angular_speed * angular_speed * max_relative_distance as f64
         + 2.0 * angular_speed * relative_velocity.length() as f64;
 
-    let conservative_sphere_aabb = || {
-        let extent = max_relative_distance + shape_radius;
-        let center = voxel_motion.local_center;
-        parry::bounding_volume::Aabb::new(
-            center - Vector::splat(extent),
-            center + Vector::splat(extent),
-        )
-    };
-
-    if !curvature_bound.is_finite() || !shape_radius.is_finite() {
-        return conservative_sphere_aabb();
+    if !curvature_bound.is_finite()
+        || !shape_radius.is_finite()
+        || !max_relative_distance.is_finite()
+        || shape_radius > Real::MAX * 0.25
+    {
+        // Infinite or numerically unbounded shapes conservatively query the complete sparse grid.
+        return full_grid_aabb;
     }
 
     let duration = end_time.max(0.0) as f64;
@@ -1313,7 +1311,7 @@ fn swept_shape_aabb_in_voxel_space(
         // If f32 time cannot represent the next conservative interval, fall back to
         // a rotation-independent sphere. This widens the query; it never drops candidates.
         if next_t <= t || next_real <= current_real {
-            return conservative_sphere_aabb();
+            return full_grid_aabb;
         }
 
         let next = local_center_at(next_real);
@@ -1364,7 +1362,7 @@ fn compute_ccd_voxel_shape_toi(
         moving_motion,
         moving_shape,
         min_toi.real(),
-        voxel_size,
+        voxels,
     );
     let voxel_shape = Cuboid::new(voxel_size / 2.0);
     let mut best_toi = min_toi;
@@ -1443,7 +1441,7 @@ fn compute_ccd_voxel_voxel_toi(
                 &source_motion,
                 &source_shape,
                 best_toi.real(),
-                voxels2.voxel_size(),
+                voxels2,
             );
 
             for target_voxel in voxels2.voxels_intersecting_local_aabb(&query_aabb) {
@@ -1486,7 +1484,7 @@ fn compute_ccd_voxel_voxel_toi(
                 &source_motion,
                 &source_shape,
                 best_toi.real(),
-                voxels1.voxel_size(),
+                voxels1,
             );
 
             for target_voxel in voxels1.voxels_intersecting_local_aabb(&query_aabb) {
