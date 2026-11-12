@@ -853,26 +853,29 @@ fn solve_continuous(
 
                     let collider_entity2 = proxy.collider;
 
-                    // If the narrow phase already has a touching contact for this pair,
-                    // the discrete contact solver is responsible for it.
-                    //
-                    // Skipping it here is important because clamping the body at the time of impact
-                    // would overwrite the already computed correction from the contact solver,
-                    // which could lead to the bodies getting frozen. This is not a problem in Box2D
-                    // because it runs CCD after updating body poses (but needs to store old poses).
-                    if contact_graph
-                        .get(collider_entity, collider_entity2)
-                        .is_some_and(|(_, pair)| pair.is_touching())
-                    {
-                        return true;
-                    }
-
-                    // Fetch the target collider and its start-of-frame pose.
+                    // Fetch the target collider before considering a discrete contact:
+                    // the voxel sweep cannot be skipped merely because the broad/narrow
+                    // phase has already identified an overlapping pair.
                     let Ok((collider2, &target_pos, &target_rot, _, _)) =
                         colliders.get(collider_entity2)
                     else {
                         return true;
                     };
+
+                    // For ordinary non-voxel contacts, keep the existing solver handoff.
+                    // For voxel pairs, the discrete manifold may represent a deep overlap
+                    // *after* the fast body has crossed multiple voxel layers. Its
+                    // is_touching() bit is not evidence of continuous non-penetration.
+                    let target_shape = collider2.shape_scaled();
+                    let voxel_pair =
+                        shape1.as_voxels().is_some() || target_shape.as_ref().as_voxels().is_some();
+                    if !voxel_pair
+                        && contact_graph
+                            .get(collider_entity, collider_entity2)
+                            .is_some_and(|(_, pair)| pair.is_touching())
+                    {
+                        return true;
+                    }
 
                     // Reconstruct the target's motion over the timestep.
                     // Bodies with a solver body are awake and moving, everything else is stationary.
@@ -942,7 +945,7 @@ fn solve_continuous(
                         &motion1,
                         &fast_shape,
                         &motion2,
-                        collider2.shape_scaled().as_ref(),
+                        target_shape.as_ref(),
                         min_toi,
                         delta_secs,
                         linear_slop,
