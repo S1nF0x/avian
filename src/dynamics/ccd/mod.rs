@@ -544,6 +544,30 @@ impl SpeculativeCcd {
     }
 }
 
+
+/// Returns a conservative AABB containing every point on a body's swept volume.
+///
+/// The center of mass translates linearly during the CCD interval. Every point on
+/// every attached collider remains within sweep_radius of that center, regardless
+/// of how many times the body rotates. Unlike merging endpoint AABBs, this cannot
+/// miss the intermediate arc of a rotating elongated body.
+#[cfg(any(feature = "parry-f32", feature = "parry-f64"))]
+fn conservative_body_swept_aabb(
+    body_com_start: crate::math::RVector,
+    delta_position: crate::math::Vector,
+    sweep_radius: f32,
+) -> crate::collision::collider::ColliderAabb {
+    use crate::math::ToRealPrecision;
+
+    let body_com_end = body_com_start + delta_position.real();
+    let radius = crate::math::Vector::splat(sweep_radius).real();
+
+    crate::collision::collider::ColliderAabb::from_min_max(
+        body_com_start.min(body_com_end) - radius,
+        body_com_start.max(body_com_end) + radius,
+    )
+}
+
 /// Read-only [`SolverBody`] motion data used to reconstruct a body's per-timestep sweep.
 #[cfg(any(feature = "parry-f32", feature = "parry-f64"))]
 #[derive(QueryData)]
@@ -755,13 +779,22 @@ fn solve_continuous(
             let collider_pos2 = body_com_world
                 + body.delta_position.real()
                 + body.delta_rotation.real() * (collider_pos1.0 - body_com_world);
-            let swept_aabb = collider1.swept_aabb(
-                collider_pos1.0,
-                collider_rot1,
-                collider_pos2,
-                collider_rot2,
-                0.0,
-            );
+            let swept_aabb = collider1
+                .swept_aabb(
+                    collider_pos1.0,
+                    collider_rot1,
+                    collider_pos2,
+                    collider_rot2,
+                    0.0,
+                )
+                // Endpoint AABB union is not conservative for a body that rotates through
+                // a large angle. The COM path expanded by the body's full sweep radius
+                // contains every collider point at every intermediate orientation.
+                .merged(conservative_body_swept_aabb(
+                    body_com_world,
+                    body.delta_position,
+                    sweep_radius,
+                ));
             let query_aabb = obvhs::aabb::Aabb::from(swept_aabb);
 
             let fast_shape = CcdFastShape {
@@ -1663,6 +1696,21 @@ mod voxel_ccd_tests {
             Vector::ZERO,
             Vector::new(0.0, 0.0, core::f32::consts::FRAC_PI_2 / DT),
         )
+    }
+
+    #[test]
+    fn swept_broadphase_bounds_include_full_rotation_arc() {
+        let aabb = conservative_body_swept_aabb(
+            crate::math::RVector::ZERO,
+            Vector::ZERO,
+            1.0,
+        );
+
+        // A long body can rotate from horizontal through vertical and back to
+        // its original endpoint AABB. The COM sphere must still include this arc.
+        assert!(aabb.min.x <= -1.0 && aabb.max.x >= 1.0);
+        assert!(aabb.min.y <= -1.0 && aabb.max.y >= 1.0);
+        assert!(aabb.min.z <= -1.0 && aabb.max.z >= 1.0);
     }
 
     #[test]
