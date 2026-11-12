@@ -153,7 +153,11 @@ impl ContactNormalPart {
             return 0.0;
         }
         let requested = requested_impulse.max(0.0);
-        if requested > self.max_impulse {
+        // Reaching the exact material capacity is failure onset too. A
+        // one-substep solve can land exactly on the cap, whereas additional
+        // substeps may request a larger impulse on the following iteration.
+        // Report the same material state in either case.
+        if self.max_impulse.is_finite() && requested >= self.max_impulse {
             self.capacity_exceeded = true;
         }
         let new_impulse = requested.min(self.max_impulse);
@@ -211,5 +215,42 @@ impl ContactNormalPart {
 
         // Return the clamped incremental normal impulse.
         impulse
+    }
+}
+
+#[cfg(test)]
+mod material_capacity_tests {
+    use super::*;
+
+    fn normal_part() -> ContactNormalPart {
+        ContactNormalPart {
+            impulse: 0.0,
+            max_impulse: f32::INFINITY,
+            capacity_exceeded: false,
+            total_impulse: 0.0,
+            effective_mass: 1.0,
+            softness: SoftnessCoefficients {
+                bias: 0.0,
+                mass_scale: 1.0,
+                impulse_scale: 0.0,
+            },
+        }
+    }
+
+    #[test]
+    fn reaching_material_yield_impulse_is_not_substep_dependent() {
+        let mut at_limit = normal_part();
+        at_limit.set_maximum_normal_impulse(10.0);
+        assert_eq!(at_limit.clamp_accumulated_impulse(10.0), 10.0);
+        assert!(at_limit.capacity_exceeded);
+
+        at_limit.reset_substep_state();
+        at_limit.impulse = 0.0;
+        assert_eq!(at_limit.clamp_accumulated_impulse(9.0), 9.0);
+        assert!(!at_limit.capacity_exceeded);
+
+        let mut ordinary_contact = normal_part();
+        assert_eq!(ordinary_contact.clamp_accumulated_impulse(10.0), 10.0);
+        assert!(!ordinary_contact.capacity_exceeded);
     }
 }
