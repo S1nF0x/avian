@@ -1267,11 +1267,10 @@ fn compute_ccd_toi(
 
 /// Builds a conservative swept AABB of the moving shape in the voxel grid's local frame.
 ///
-/// The center of mass of each rigid motion follows a line. In the voxel-grid frame,
-/// the relative center follows q(t) = R(t)^-1 * (d0 + v_rel * t). Its second
-/// derivative is bounded by |ω|² |d| + 2 |ω| |v_rel|, so each sampled chord can
-/// be expanded by M * Δt² / 8 without missing the curved path. The moving shape
-/// itself is enclosed by a sphere centered at its center of mass.
+/// The moving shape is enclosed by its rotation-invariant bounding sphere. The sphere
+/// center follows the moving body's rigid motion, then is expressed in the voxel-grid
+/// frame. A bound on the second derivative of that relative path gives a conservative
+/// chord expansion of M * Δt² / 8 for every interval.
 #[cfg(any(feature = "parry-f32", feature = "parry-f64"))]
 fn swept_shape_aabb_in_voxel_space(
     voxel_motion: &NonlinearRigidMotion,
@@ -1286,29 +1285,46 @@ fn swept_shape_aabb_in_voxel_space(
     let full_grid_aabb =
         <parry::shape::Voxels as parry::shape::Shape>::compute_local_aabb(voxel_grid);
     let sphere = moving_shape.compute_local_bounding_sphere();
-    let shape_radius = sphere.radius()
-        + (sphere.center() - moving_motion.local_center).length();
+    let sphere_radius = sphere.radius();
+    let moving_radius_from_com = (sphere.center() - moving_motion.local_center).length();
 
     let voxel_com0 = voxel_motion.start * voxel_motion.local_center;
     let moving_com0 = moving_motion.start * moving_motion.local_center;
-    let relative_start = moving_com0 - voxel_com0;
+    let relative_com_start = moving_com0 - voxel_com0;
     let relative_velocity = moving_motion.linvel - voxel_motion.linvel;
-    let relative_end = relative_start + relative_velocity * end_time;
+    let relative_com_end = relative_com_start + relative_velocity * end_time;
 
     #[cfg(feature = "2d")]
-    let angular_speed = voxel_motion.angvel.abs();
+    let voxel_angular_speed = voxel_motion.angvel.abs();
     #[cfg(feature = "3d")]
-    let angular_speed = voxel_motion.angvel.length();
+    let voxel_angular_speed = voxel_motion.angvel.length();
+    #[cfg(feature = "2d")]
+    let moving_angular_speed = moving_motion.angvel.abs();
+    #[cfg(feature = "3d")]
+    let moving_angular_speed = moving_motion.angvel.length();
 
-    let max_relative_distance = relative_start.length().max(relative_end.length());
-    let angular_speed = angular_speed as f64;
-    let curvature_bound = angular_speed * angular_speed * max_relative_distance as f64
-        + 2.0 * angular_speed * relative_velocity.length() as f64;
+    let max_relative_com_distance =
+        relative_com_start.length().max(relative_com_end.length());
+    let voxel_angular_speed = voxel_angular_speed as f64;
+    let moving_angular_speed = moving_angular_speed as f64;
+    let moving_radius_from_com = moving_radius_from_com as f64;
+    let relative_speed = relative_velocity.length() as f64;
+
+    // d(t) is the moving sphere center relative to the voxel body's COM.
+    // Its first derivative is bounded by |v_rel| + |ω_moving| r.
+    // Its second derivative is bounded by |ω_moving|² r.
+    // Expressing d(t) in the rotating voxel frame adds the two voxel-angular terms.
+    let curvature_bound = moving_angular_speed * moving_angular_speed * moving_radius_from_com
+        + 2.0 * voxel_angular_speed
+            * (relative_speed + moving_angular_speed * moving_radius_from_com)
+        + voxel_angular_speed
+            * voxel_angular_speed
+            * (max_relative_com_distance as f64 + moving_radius_from_com);
 
     if !curvature_bound.is_finite()
-        || !shape_radius.is_finite()
-        || !max_relative_distance.is_finite()
-        || shape_radius > Real::MAX * 0.25
+        || !sphere_radius.is_finite()
+        || !max_relative_com_distance.is_finite()
+        || sphere_radius > Real::MAX * 0.25
     {
         // Infinite or numerically unbounded shapes conservatively query the complete sparse grid.
         return full_grid_aabb;
@@ -1322,15 +1338,15 @@ fn swept_shape_aabb_in_voxel_space(
         duration
     };
 
-    let local_center_at = |time: Real| {
-        let world_com = moving_com0 + moving_motion.linvel * time;
+    let local_sphere_center_at = |time: Real| {
+        let world_center = moving_motion.position_at_time(time) * sphere.center();
         voxel_motion
             .position_at_time(time)
-            .inverse_transform_point(world_com)
+            .inverse_transform_point(world_center)
     };
 
     let mut t = 0.0_f64;
-    let mut previous = local_center_at(0.0);
+    let mut previous = local_sphere_center_at(0.0);
     let mut mins = previous;
     let mut maxs = previous;
     let mut max_chord_error = 0.0_f64;
@@ -1347,7 +1363,7 @@ fn swept_shape_aabb_in_voxel_space(
             return full_grid_aabb;
         }
 
-        let next = local_center_at(next_real);
+        let next = local_sphere_center_at(next_real);
         mins = mins.min(next);
         maxs = maxs.max(next);
         max_chord_error = max_chord_error.max(curvature_bound * step * step / 8.0);
@@ -1359,9 +1375,12 @@ fn swept_shape_aabb_in_voxel_space(
     mins = mins.min(previous);
     maxs = maxs.max(previous);
 
-    let coordinate_scale = max_relative_distance as f64 + shape_radius as f64 + 1.0;
+    let coordinate_scale = max_relative_com_distance as f64
+        + moving_radius_from_com
+        + sphere_radius as f64
+        + 1.0;
     let roundoff_margin = Real::EPSILON as f64 * coordinate_scale * 16.0;
-    let margin = (shape_radius as f64 + max_chord_error + roundoff_margin) as Real;
+    let margin = (sphere_radius as f64 + max_chord_error + roundoff_margin) as Real;
     let margin = margin.max(0.0);
 
     parry::bounding_volume::Aabb::new(
@@ -1369,7 +1388,6 @@ fn swept_shape_aabb_in_voxel_space(
         maxs + Vector::splat(margin),
     )
 }
-
 /// Sweeps every occupied voxel that can intersect a moving shape's conservative path.
 ///
 /// Each candidate is tested as a real cuboid with the complete nonlinear rigid motion.
