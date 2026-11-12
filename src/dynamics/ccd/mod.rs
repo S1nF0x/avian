@@ -964,9 +964,11 @@ fn solve_continuous(
                                     .contains(crate::collider_tree::ColliderTreeProxyFlags::CONTACT_EVENTS),
                             modify_contacts: proxy1.has_contact_modification()
                                 || proxy.has_contact_modification(),
-                            // Cover the possible post-TOI travel of either body. The narrow
-                            // phase will decide whether the resulting speculative contact is kept.
-                            distance: max_motion.max(target_max_motion),
+                            // The fast body is stopped at TOI. Only motion of the
+                            // *other* body can open a post-impact gap before the next
+                            // narrow phase. Using fast-body travel here would create
+                            // huge ghost contacts (5 m at 300 m/s) against static walls.
+                            distance: target_max_motion + linear_slop,
                         });
                     }
 
