@@ -1031,47 +1031,54 @@ fn solve_continuous(
             // In the `tumbler` example, this manifested as dynamic boxes continuously having a TOI impact
             // against the spinning container, being effectively frozen in place with no proper
             // velocity correction, which also caused significant overlap with other boxes.
-            if fraction < 1.0
-                && let Some(impact) = impact
-            {
-                // A TOI pair may not have existed in the discrete broad phase because its
-                // start-of-step AABBs were separated. Create the edge now so the next
-                // narrow phase can generate a real or speculative contact constraint.
-                let mut edge = crate::collision::contact_types::ContactEdge::new(
-                    impact.collider1,
-                    impact.collider2,
-                );
-                edge.body1 = impact.body1;
-                edge.body2 = impact.body2;
-                edge.flags.set(
-                    crate::collision::contact_types::ContactEdgeFlags::CONTACT_EVENTS,
-                    impact.contact_events,
-                );
-
-                contact_graph.add_edge_with(edge, |pair| {
-                    pair.body1 = impact.body1;
-                    pair.body2 = impact.body2;
-                    pair.flags.set(
-                        crate::collision::contact_types::ContactPairFlags::GENERATE_CONSTRAINTS,
-                        true,
-                    );
-                    pair.flags.set(
-                        crate::collision::contact_types::ContactPairFlags::MODIFY_CONTACTS,
-                        impact.modify_contacts,
-                    );
-                    pair.speculative_distance = impact.distance;
-                });
-
-                if let Some((_edge, pair)) =
-                    contact_graph.get_mut(impact.collider1, impact.collider2)
-                {
-                    pair.speculative_distance = pair.speculative_distance.max(impact.distance);
-                }
+            if fraction < 1.0 && let Some(impact) = impact {
+                ensure_ccd_contact_pair(&mut contact_graph, impact);
             }
         }
     }
 
     diagnostics.swept_ccd += start.elapsed();
+}
+
+
+/// Ensures a TOI impact is handed to the discrete narrow phase on the next frame.
+///
+/// Swept pairs can be absent from the ordinary broad phase because their start-of-step
+/// AABBs do not overlap. Creating the contact edge here lets the next narrow phase
+/// build a real or speculative contact constraint instead of losing the TOI result.
+#[cfg(any(feature = "parry-f32", feature = "parry-f64"))]
+fn ensure_ccd_contact_pair(
+    contact_graph: &mut ContactGraph,
+    impact: CcdImpact,
+) {
+    let mut edge = crate::collision::contact_types::ContactEdge::new(
+        impact.collider1,
+        impact.collider2,
+    );
+    edge.body1 = impact.body1;
+    edge.body2 = impact.body2;
+    edge.flags.set(
+        crate::collision::contact_types::ContactEdgeFlags::CONTACT_EVENTS,
+        impact.contact_events,
+    );
+
+    contact_graph.add_edge_with(edge, |pair| {
+        pair.body1 = impact.body1;
+        pair.body2 = impact.body2;
+        pair.flags.set(
+            crate::collision::contact_types::ContactPairFlags::GENERATE_CONSTRAINTS,
+            true,
+        );
+        pair.flags.set(
+            crate::collision::contact_types::ContactPairFlags::MODIFY_CONTACTS,
+            impact.modify_contacts,
+        );
+        pair.speculative_distance = impact.distance;
+    });
+
+    if let Some((_edge, pair)) = contact_graph.get_mut(impact.collider1, impact.collider2) {
+        pair.speculative_distance = pair.speculative_distance.max(impact.distance);
+    }
 }
 
 /// Reconstructs the sweep of a single collider for the timestep from its [`SolverBody`] deltas,
@@ -1809,6 +1816,54 @@ mod voxel_ccd_tests {
             Vector::ZERO,
             Vector::new(0.0, 0.0, core::f32::consts::FRAC_PI_2 / DT),
         )
+    }
+
+    #[test]
+    fn ccd_toi_creates_and_updates_a_discrete_contact_pair() {
+        let mut world = bevy::prelude::World::new();
+        let collider1 = world.spawn_empty().id();
+        let collider2 = world.spawn_empty().id();
+        let body1 = world.spawn_empty().id();
+        let body2 = world.spawn_empty().id();
+        let mut graph = crate::collision::contact_types::ContactGraph::default();
+
+        let impact = CcdImpact {
+            collider1,
+            collider2,
+            body1: Some(body1),
+            body2: Some(body2),
+            contact_events: true,
+            modify_contacts: true,
+            distance: 2.0,
+        };
+        ensure_ccd_contact_pair(&mut graph, impact);
+
+        let (edge, pair) = graph.get(collider1, collider2).expect("TOI pair must exist");
+        assert_eq!(edge.body1, Some(body1));
+        assert_eq!(edge.body2, Some(body2));
+        assert!(edge.flags.contains(
+            crate::collision::contact_types::ContactEdgeFlags::CONTACT_EVENTS
+        ));
+        assert!(pair.flags.contains(
+            crate::collision::contact_types::ContactPairFlags::GENERATE_CONSTRAINTS
+        ));
+        assert!(pair.flags.contains(
+            crate::collision::contact_types::ContactPairFlags::MODIFY_CONTACTS
+        ));
+        assert_eq!(pair.speculative_distance, 2.0);
+        assert_eq!(graph.active_pairs().len(), 1);
+
+        ensure_ccd_contact_pair(
+            &mut graph,
+            CcdImpact {
+                distance: 4.0,
+                ..impact
+            },
+        );
+
+        let (_, pair) = graph.get(collider1, collider2).expect("TOI pair must persist");
+        assert_eq!(pair.speculative_distance, 4.0);
+        assert_eq!(graph.active_pairs().len(), 1);
     }
 
     #[test]
