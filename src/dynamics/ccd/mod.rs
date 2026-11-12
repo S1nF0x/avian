@@ -1800,7 +1800,6 @@ mod voxel_ccd_tests {
             );
         }
     }
-}
 
     fn rotating_voxel_bar() -> SharedShape {
         let coords: Vec<_> = (-10..10)
