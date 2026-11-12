@@ -1007,10 +1007,21 @@ fn collider_sweep_motion(
     let collider_rot = collider_rot.into();
 
     let lin_vel = solver_body.delta_position * inv_dt;
+    // A quaternion/Rot delta only stores the net orientation and aliases full turns.
+    // For more than a half-turn of angular travel, use angular velocity so the sweep
+    // preserves the winding path instead of collapsing it to the shortest rotation.
     #[cfg(feature = "2d")]
-    let ang_vel = solver_body.delta_rotation.as_radians() * inv_dt;
+    let ang_vel = if solver_body.angular_velocity.abs() / inv_dt > core::f32::consts::PI {
+        solver_body.angular_velocity
+    } else {
+        solver_body.delta_rotation.as_radians() * inv_dt
+    };
     #[cfg(feature = "3d")]
-    let ang_vel = solver_body.delta_rotation.to_scaled_axis() * inv_dt;
+    let ang_vel = if solver_body.angular_velocity.length() / inv_dt > core::f32::consts::PI {
+        solver_body.angular_velocity
+    } else {
+        solver_body.delta_rotation.to_scaled_axis() * inv_dt
+    };
 
     // The body's center of mass expressed in the collider's local frame
     let local_center = collider_rot.inverse() * (com_world - collider_pos).f32();
@@ -1729,6 +1740,54 @@ mod voxel_ccd_tests {
         assert!(aabb.min.x <= -1.0 && aabb.max.x >= 1.0);
         assert!(aabb.min.y <= -1.0 && aabb.max.y >= 1.0);
         assert!(aabb.min.z <= -1.0 && aabb.max.z >= 1.0);
+    }
+
+    #[test]
+    fn voxel_ccd_preserves_multi_turn_rotation_winding() {
+        let voxel = SharedShape::voxels(
+            Vector::splat(0.1),
+            &[IVector::new(8, -1, -1)],
+        );
+        let wall = SharedShape::new(Cuboid::new(Vector::splat(0.05)));
+        let body = crate::dynamics::solver::solver_body::SolverBody {
+            linear_velocity: crate::math::Vector::ZERO,
+            angular_velocity: crate::math::Vector::new(
+                0.0,
+                0.0,
+                2.5 * core::f32::consts::PI / DT,
+            ),
+            delta_position: crate::math::Vector::ZERO,
+            // Net orientation is only 90 degrees, but the actual path makes 2.5 turns.
+            delta_rotation: bevy::math::Quat::from_rotation_z(
+                core::f32::consts::FRAC_PI_2,
+            ),
+            flags: Default::default(),
+        };
+        let motion = collider_sweep_motion(
+            crate::math::RVector::ZERO,
+            bevy::math::Quat::IDENTITY,
+            crate::math::RVector::ZERO,
+            &body,
+            1.0 / DT,
+        );
+        let wall_motion = NonlinearRigidMotion::constant_position(
+            Pose::translation(-0.8, 0.0, 0.0),
+        );
+        let fast = fast_shape(voxel.as_ref());
+
+        let toi = compute_ccd_toi(
+            SweepMode::NonLinear,
+            &motion,
+            &fast,
+            &wall_motion,
+            wall.as_ref(),
+            DT,
+            DT,
+            0.005,
+        )
+        .expect("multi-turn voxel sweep must find the intermediate 180-degree impact");
+
+        assert!(toi > 0.0 && toi < DT * 0.5, "invalid winding TOI: {toi}");
     }
 
     #[test]
