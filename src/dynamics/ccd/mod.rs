@@ -990,7 +990,7 @@ fn solve_continuous(
         // without requiring another special-purpose debug scene.
         if voxel_sweeps != 0 {
             if let Some(impact) = best_impact {
-                info!(
+                debug!(
                     "VOXEL_CCD_HIT body={:?} target={:?} speed_m_s={:.3} swept_distance_m={:.3} toi_s={:.7} fraction={:.7} candidates={}",
                     fast.entity, impact.collider2, lin_speed, max_motion, min_toi,
                     min_toi * inv_dt, voxel_candidates,
