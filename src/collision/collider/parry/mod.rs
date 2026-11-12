@@ -30,7 +30,7 @@ impl<T: IntoCollider<Collider>> From<T> for Collider {
 
 /// Returns `true` if the given shape supports CCD sweeps.
 ///
-/// Parry provides sparse voxel time-of-impact queries. Keep voxel shapes enabled here:
+/// Voxel shapes have a dedicated sparse TOI path in the CCD system. Keep them enabled:
 /// this predicate also controls whether a collider receives a finite CCD thickness.
 pub(crate) fn shape_supports_sweeps(shape: &dyn parry::shape::Shape) -> bool {
     !matches!(

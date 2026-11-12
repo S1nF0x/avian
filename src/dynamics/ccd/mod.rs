@@ -1308,8 +1308,8 @@ fn swept_shape_aabb_in_voxel_space(
         let current_real = t as Real;
         let next_real = next_t as Real;
 
-        // If f32 time cannot represent the next conservative interval, fall back to
-        // a rotation-independent sphere. This widens the query; it never drops candidates.
+        // If f32 time cannot represent the next conservative interval, query the
+        // complete sparse grid. This widens the candidate set; it never drops candidates.
         if next_t <= t || next_real <= current_real {
             return full_grid_aabb;
         }
