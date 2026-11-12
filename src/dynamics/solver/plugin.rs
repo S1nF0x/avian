@@ -1068,11 +1068,19 @@ fn store_contact_impulses(
                 contact_id: constraint.contact_id,
                 manifold_index: constraint.manifold_index,
             }) else {
-                unreachable!(
-                    "Contact manifold {:?} for contact ID {:?} not found in contact graph.",
-                    constraint.contact_id, constraint.manifold_index
-                );
+                // A material fracture may replace a collider while the current
+                // solver's contact constraints are still alive. The removed
+                // manifold cannot receive warm-start impulses and must not
+                // trigger a panic: it has no valid surface to warm-start.
+                continue;
             };
+
+            if manifold.points.len() != constraint.points.len() {
+                // ContactId and manifold indices can be reused as collider
+                // geometry changes. Never copy impulses to a different
+                // point layout, even if the numeric handles still match.
+                continue;
+            }
 
             for (contact, constraint_point) in
                 manifold.points.iter_mut().zip(constraint.points.iter())
@@ -1179,4 +1187,58 @@ fn inverse_on_free_axes(inv_inertia: SymmetricTensor) -> SymmetricTensor {
         Vec3::ZERO,
     ));
     (inv_inertia + locked).inverse_or_zero() - locked
+}
+
+
+// Contact topology is allowed to change between constraint preparation and
+// warm-start impulse writeback. The solver must ignore obsolete manifolds.
+#[cfg(all(test, feature = "3d"))]
+mod fracture_contact_store_tests {
+    use super::*;
+
+    fn empty_constraint(contact_id: ContactId) -> ContactConstraint {
+        ContactConstraint {
+            body_index1: SolverBodyIndex::INVALID,
+            body_index2: SolverBodyIndex::INVALID,
+            relative_dominance: 0,
+            friction: 0.0,
+            restitution: 0.0,
+            tangent_velocity: Vector::ZERO,
+            normal: Vector::X,
+            tangent1: Vector::Y,
+            points: Vec::new(),
+            contact_id,
+            manifold_index: 0,
+        }
+    }
+
+    #[test]
+    fn storing_impulses_ignores_removed_contact_manifolds() {
+        let mut app = App::new();
+        app.init_resource::<ContactGraph>()
+            .init_resource::<ConstraintGraph>()
+            .init_resource::<SolverDiagnostics>();
+        app.add_systems(Update, store_contact_impulses);
+
+        let a = app.world_mut().spawn_empty().id();
+        let b = app.world_mut().spawn_empty().id();
+        let contact_id = app
+            .world_mut()
+            .resource_mut::<ContactGraph>()
+            .add_edge(ContactEdge::new(a, b))
+            .expect("a new contact edge");
+        app.world_mut()
+            .resource_mut::<ConstraintGraph>()
+            .colors[0]
+            .contact_constraints
+            .push(empty_constraint(contact_id));
+
+        // A contact ID can still exist even if its old manifold was
+        // invalidated by a new voxel collider.
+        app.update();
+
+        // An entirely removed pair is also legitimate after a fracture.
+        app.world_mut().resource_mut::<ContactGraph>().remove_edge(a, b);
+        app.update();
+    }
 }
