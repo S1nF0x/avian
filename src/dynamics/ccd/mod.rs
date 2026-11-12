@@ -1433,8 +1433,12 @@ fn cast_voxel_cuboid_toi(
             ShapeCastOptions {
                 max_time_of_impact: max_toi.real(),
                 target_distance: 0.0,
-                stop_at_penetration: true,
-                compute_impact_geometry_on_penetration: false,
+                // When a voxel body starts the frame touching a solid face,
+                // reject separating motion but retain an approaching t=0 TOI.
+                // Discarding all t=0 TOIs allows a fast body to creep through a
+                // wall over consecutive frames after the first CCD truncation.
+                stop_at_penetration: false,
+                compute_impact_geometry_on_penetration: true,
             },
         )
     } else {
@@ -1445,13 +1449,13 @@ fn cast_voxel_cuboid_toi(
             shape2,
             0.0,
             max_toi.real(),
-            true,
+            false,
         )
     };
     hit.ok()
         .flatten()
         .map(|hit| hit.time_of_impact.f32())
-        .filter(|toi| *toi > 0.0 && *toi < max_toi && toi.is_finite())
+        .filter(|toi| *toi >= 0.0 && *toi < max_toi && toi.is_finite())
 }
 
 /// Builds a conservative swept AABB of the moving shape in the voxel grid's local frame.
@@ -1999,6 +2003,46 @@ mod voxel_ccd_tests {
         .expect("multi-turn voxel sweep must find the intermediate 180-degree impact");
 
         assert!(toi > 0.0 && toi < DT * 0.5, "invalid winding TOI: {toi}");
+    }
+
+    #[test]
+    fn voxel_toi_preserves_zero_time_contact_only_when_closing() {
+        let moving = SharedShape::voxels(
+            Vector::splat(0.1),
+            &[IVector::new(0, 0, 0)],
+        );
+        let wall = SharedShape::voxels(
+            Vector::splat(0.1),
+            &[IVector::new(0, 0, 0)],
+        );
+        let stationary = NonlinearRigidMotion::constant_position(Pose::identity());
+
+        for mode in [SweepMode::Linear, SweepMode::NonLinear] {
+            let fast = fast_shape(moving.as_ref());
+            let approach = NonlinearRigidMotion::new(
+                Pose::translation(-0.1, 0.0, 0.0),
+                Vector::ZERO,
+                Vector::new(3430.0, 0.0, 0.0),
+                Vector::ZERO,
+            );
+            assert_eq!(
+                compute_ccd_toi(mode, &approach, &fast, &stationary, wall.as_ref(), DT, DT, 0.005),
+                Some(0.0),
+                "a body starting at a face must not pass through it"
+            );
+
+            let separation = NonlinearRigidMotion::new(
+                Pose::translation(-0.1, 0.0, 0.0),
+                Vector::ZERO,
+                Vector::new(-3430.0, 0.0, 0.0),
+                Vector::ZERO,
+            );
+            assert_eq!(
+                compute_ccd_toi(mode, &separation, &fast, &stationary, wall.as_ref(), DT, DT, 0.005),
+                None,
+                "a separating body must not be held by stale contact"
+            );
+        }
     }
 
     #[test]
