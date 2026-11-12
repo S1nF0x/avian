@@ -877,12 +877,40 @@ fn solve_continuous(
                     if voxel_pair {
                         voxel_candidates += 1;
                     }
-                    if !voxel_pair
-                        && contact_graph
-                            .get(collider_entity, collider_entity2)
-                            .is_some_and(|(_, pair)| pair.is_touching())
+                    if let Some((_, pair)) =
+                        contact_graph.get(collider_entity, collider_entity2)
                     {
-                        return true;
+                        if pair.is_touching() {
+                            if !voxel_pair {
+                                return true;
+                            }
+
+                            // A resting voxel body may have a zero-time hit
+                            // against its support surface every frame. CCD
+                            // must not truncate tangential motion (a truck
+                            // driving across the ground) just because the
+                            // support is already touching. Only skip such a
+                            // pair if its existing manifolds are shallow and
+                            // every contact normal is approximately tangent
+                            // to the entire body's impending motion. A new
+                            // wall hit, deep overlap, or substantial rotation
+                            // still requires the conservative voxel sweep.
+                            let shallow_tangential_contact =
+                                body.delta_rotation.chord_length() * sweep_radius
+                                    <= linear_slop
+                                    && !pair.manifolds.is_empty()
+                                    && pair.manifolds.iter().all(|manifold| {
+                                        manifold.normal.dot(body.delta_position).abs()
+                                            <= linear_slop
+                                            && manifold.points.iter().any(|point| {
+                                                point.penetration >= -linear_slop
+                                                    && point.penetration <= 2.0 * linear_slop
+                                            })
+                                    });
+                            if shallow_tangential_contact {
+                                return true;
+                            }
+                        }
                     }
 
                     // Reconstruct the target's motion over the timestep.
