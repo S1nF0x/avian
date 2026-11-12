@@ -1608,7 +1608,9 @@ fn compute_ccd_voxel_shape_toi(
     let mut best_toi = min_toi;
 
     for voxel in voxels.voxels_intersecting_local_aabb(&query_aabb) {
-        if voxel.state.is_empty() {
+        // The earliest entry contact is necessarily on an exposed voxel face.
+        // Interior voxels can only overlap after a surface has already collided.
+        if voxel.state.is_empty() || voxel.state.free_faces().is_empty() {
             continue;
         }
 
@@ -1663,7 +1665,9 @@ fn compute_ccd_voxel_voxel_toi(
         let target_shape = Cuboid::new(voxels2.voxel_size() / 2.0);
 
         for source_voxel in voxels1.voxels() {
-            if source_voxel.state.is_empty() {
+            if source_voxel.state.is_empty()
+                || source_voxel.state.free_faces().is_empty()
+            {
                 continue;
             }
 
@@ -1677,7 +1681,9 @@ fn compute_ccd_voxel_voxel_toi(
             );
 
             for target_voxel in voxels2.voxels_intersecting_local_aabb(&query_aabb) {
-                if target_voxel.state.is_empty() {
+                if target_voxel.state.is_empty()
+                    || target_voxel.state.free_faces().is_empty()
+                {
                     continue;
                 }
 
@@ -1698,7 +1704,9 @@ fn compute_ccd_voxel_voxel_toi(
         let target_shape = Cuboid::new(voxels1.voxel_size() / 2.0);
 
         for source_voxel in voxels2.voxels() {
-            if source_voxel.state.is_empty() {
+            if source_voxel.state.is_empty()
+                || source_voxel.state.free_faces().is_empty()
+            {
                 continue;
             }
 
@@ -1712,7 +1720,9 @@ fn compute_ccd_voxel_voxel_toi(
             );
 
             for target_voxel in voxels1.voxels_intersecting_local_aabb(&query_aabb) {
-                if target_voxel.state.is_empty() {
+                if target_voxel.state.is_empty()
+                    || target_voxel.state.free_faces().is_empty()
+                {
                     continue;
                 }
 
