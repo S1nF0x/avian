@@ -590,8 +590,12 @@ impl Collider {
     pub fn set_shape(&mut self, shape: SharedShape) {
         self.shape = shape;
 
-        // TODO: The number of subdivisions probably shouldn't be hard-coded
-        if let Ok(scaled) = scale_shape(&self.shape, self.scale, 10) {
+        // Unit-scale shapes can share the original geometry. Scaling a voxel
+        // collider by ONE would otherwise clone and rebuild its entire sparse
+        // acceleration structure on every local voxel edit.
+        if self.scale == Vector::ONE {
+            self.scaled_shape = self.shape.clone();
+        } else if let Ok(scaled) = scale_shape(&self.shape, self.scale, 10) {
             self.scaled_shape = scaled;
         } else {
             log::error!("Failed to create convex hull for scaled collider.");
