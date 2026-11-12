@@ -1056,6 +1056,33 @@ fn compute_ccd_toi(
     delta_secs: f32,
     linear_slop: f32,
 ) -> Option<f32> {
+    // Parry's built-in voxel nonlinear cast freezes the voxel body's rotation and
+    // propagates only a translational search frontier. Use a rotation-aware sparse
+    // candidate query here, then cast the candidate voxel cuboids with full rigid motion.
+    if mode == SweepMode::NonLinear {
+        let voxels1 = fast.shape.as_voxels();
+        let voxels2 = shape2.as_voxels();
+
+        match (voxels1, voxels2) {
+            (Some(voxels1), Some(voxels2)) => {
+                return compute_ccd_voxel_voxel_toi(
+                    voxels1, motion1, voxels2, motion2, min_toi,
+                );
+            }
+            (Some(voxels), None) => {
+                return compute_ccd_voxel_shape_toi(
+                    voxels, motion1, motion2, shape2, true, min_toi,
+                );
+            }
+            (None, Some(voxels)) => {
+                return compute_ccd_voxel_shape_toi(
+                    voxels, motion2, motion1, fast.shape, false, min_toi,
+                );
+            }
+            (None, None) => {}
+        }
+    }
+
     if mode == SweepMode::NonLinear
         && let Some(proxy1) = ToiProxy::from_shape(fast.shape)
     {
@@ -1205,6 +1232,293 @@ fn compute_ccd_toi(
     (toi > 0.0 && toi < min_toi).then_some(toi)
 }
 
+
+/// Builds a conservative swept AABB of the moving shape in the voxel grid's local frame.
+///
+/// The center of mass of each rigid motion follows a line. In the voxel-grid frame,
+/// the relative center follows q(t) = R(t)^-1 * (d0 + v_rel * t). Its second
+/// derivative is bounded by |ω|² |d| + 2 |ω| |v_rel|, so each sampled chord can
+/// be expanded by M * Δt² / 8 without missing the curved path. The moving shape
+/// itself is enclosed by a sphere centered at its center of mass.
+#[cfg(any(feature = "parry-f32", feature = "parry-f64"))]
+fn swept_shape_aabb_in_voxel_space(
+    voxel_motion: &NonlinearRigidMotion,
+    moving_motion: &NonlinearRigidMotion,
+    moving_shape: &dyn parry::shape::Shape,
+    end_time: parry::math::Real,
+    voxel_size: parry::math::Vector,
+) -> parry::bounding_volume::Aabb {
+    use parry::math::{Real, Vector};
+
+    let sphere = moving_shape.compute_local_bounding_sphere();
+    let shape_radius = sphere.radius()
+        + (sphere.center() - moving_motion.local_center).length();
+
+    let voxel_com0 = voxel_motion.start * voxel_motion.local_center;
+    let moving_com0 = moving_motion.start * moving_motion.local_center;
+    let relative_start = moving_com0 - voxel_com0;
+    let relative_velocity = moving_motion.linvel - voxel_motion.linvel;
+    let relative_end = relative_start + relative_velocity * end_time;
+
+    #[cfg(feature = "2d")]
+    let angular_speed = voxel_motion.angvel.abs();
+    #[cfg(feature = "3d")]
+    let angular_speed = voxel_motion.angvel.length();
+
+    let max_relative_distance = relative_start.length().max(relative_end.length());
+    let angular_speed = angular_speed as f64;
+    let curvature_bound = angular_speed * angular_speed * max_relative_distance as f64
+        + 2.0 * angular_speed * relative_velocity.length() as f64;
+
+    let conservative_sphere_aabb = || {
+        let extent = max_relative_distance + shape_radius;
+        let center = voxel_motion.local_center;
+        parry::bounding_volume::Aabb::new(
+            center - Vector::splat(extent),
+            center + Vector::splat(extent),
+        )
+    };
+
+    if !curvature_bound.is_finite() || !shape_radius.is_finite() {
+        return conservative_sphere_aabb();
+    }
+
+    let duration = end_time.max(0.0) as f64;
+    let tolerance = (voxel_size.min_element().abs() as f64 * 0.5).max(f64::MIN_POSITIVE);
+    let max_step = if curvature_bound > 0.0 {
+        (8.0 * tolerance / curvature_bound).sqrt()
+    } else {
+        duration
+    };
+
+    let local_center_at = |time: Real| {
+        let world_com = moving_com0 + moving_motion.linvel * time;
+        voxel_motion
+            .position_at_time(time)
+            .inverse_transform_point(world_com)
+    };
+
+    let mut t = 0.0_f64;
+    let mut previous = local_center_at(0.0);
+    let mut mins = previous;
+    let mut maxs = previous;
+    let mut max_chord_error = 0.0_f64;
+
+    while t < duration {
+        let step = max_step.min(duration - t);
+        let next_t = t + step;
+        let current_real = t as Real;
+        let next_real = next_t as Real;
+
+        // If f32 time cannot represent the next conservative interval, fall back to
+        // a rotation-independent sphere. This widens the query; it never drops candidates.
+        if next_t <= t || next_real <= current_real {
+            return conservative_sphere_aabb();
+        }
+
+        let next = local_center_at(next_real);
+        mins = mins.min(next);
+        maxs = maxs.max(next);
+        max_chord_error = max_chord_error.max(curvature_bound * step * step / 8.0);
+
+        previous = next;
+        t = next_t;
+    }
+
+    mins = mins.min(previous);
+    maxs = maxs.max(previous);
+
+    let coordinate_scale = max_relative_distance as f64 + shape_radius as f64 + 1.0;
+    let roundoff_margin = Real::EPSILON as f64 * coordinate_scale * 16.0;
+    let margin = (shape_radius as f64 + max_chord_error + roundoff_margin) as Real;
+    let margin = margin.max(0.0);
+
+    parry::bounding_volume::Aabb::new(
+        mins - Vector::splat(margin),
+        maxs + Vector::splat(margin),
+    )
+}
+
+/// Sweeps every occupied voxel that can intersect a moving shape's conservative path.
+///
+/// Each candidate is tested as a real cuboid with the complete nonlinear rigid motion.
+/// This avoids the translational-only assumption in Parry's built-in voxel traversal.
+#[cfg(any(feature = "parry-f32", feature = "parry-f64"))]
+fn compute_ccd_voxel_shape_toi(
+    voxels: &parry::shape::Voxels,
+    voxel_motion: &NonlinearRigidMotion,
+    moving_motion: &NonlinearRigidMotion,
+    moving_shape: &dyn parry::shape::Shape,
+    voxel_is_shape1: bool,
+    min_toi: f32,
+) -> Option<f32> {
+    use parry::shape::Cuboid;
+
+    if min_toi <= 0.0 {
+        return None;
+    }
+
+    let voxel_size = voxels.voxel_size();
+    let query_aabb = swept_shape_aabb_in_voxel_space(
+        voxel_motion,
+        moving_motion,
+        moving_shape,
+        min_toi.real(),
+        voxel_size,
+    );
+    let voxel_shape = Cuboid::new(voxel_size / 2.0);
+    let mut best_toi = min_toi;
+
+    for voxel in voxels.voxels_intersecting_local_aabb(&query_aabb) {
+        if voxel.state.is_empty() {
+            continue;
+        }
+
+        let candidate_motion = voxel_motion.prepend_translation(voxel.center);
+        let hit = if voxel_is_shape1 {
+            cast_shapes_nonlinear(
+                &candidate_motion,
+                &voxel_shape,
+                moving_motion,
+                moving_shape,
+                0.0,
+                best_toi.real(),
+                false,
+            )
+        } else {
+            cast_shapes_nonlinear(
+                moving_motion,
+                moving_shape,
+                &candidate_motion,
+                &voxel_shape,
+                0.0,
+                best_toi.real(),
+                false,
+            )
+        };
+
+        if let Some(hit) = hit.ok().flatten() {
+            let toi = hit.time_of_impact.f32();
+            if toi > 0.0 && toi < best_toi {
+                best_toi = toi;
+            }
+        }
+    }
+
+    (best_toi < min_toi).then_some(best_toi)
+}
+
+/// Performs nonlinear CCD between two voxel grids by querying candidate voxel pairs
+/// through the target grid's sparse chunk BVH and casting actual cuboid pairs.
+#[cfg(any(feature = "parry-f32", feature = "parry-f64"))]
+fn compute_ccd_voxel_voxel_toi(
+    voxels1: &parry::shape::Voxels,
+    motion1: &NonlinearRigidMotion,
+    voxels2: &parry::shape::Voxels,
+    motion2: &NonlinearRigidMotion,
+    min_toi: f32,
+) -> Option<f32> {
+    use parry::shape::Cuboid;
+
+    if min_toi <= 0.0 {
+        return None;
+    }
+
+    let count1 = voxels1.voxels().count();
+    let count2 = voxels2.voxels().count();
+    let mut best_toi = min_toi;
+
+    if count1 <= count2 {
+        let source_shape = Cuboid::new(voxels1.voxel_size() / 2.0);
+        let target_shape = Cuboid::new(voxels2.voxel_size() / 2.0);
+
+        for source_voxel in voxels1.voxels() {
+            if source_voxel.state.is_empty() {
+                continue;
+            }
+
+            let source_motion = motion1.prepend_translation(source_voxel.center);
+            let query_aabb = swept_shape_aabb_in_voxel_space(
+                motion2,
+                &source_motion,
+                &source_shape,
+                best_toi.real(),
+                voxels2.voxel_size(),
+            );
+
+            for target_voxel in voxels2.voxels_intersecting_local_aabb(&query_aabb) {
+                if target_voxel.state.is_empty() {
+                    continue;
+                }
+
+                let target_motion = motion2.prepend_translation(target_voxel.center);
+                if let Some(hit) = cast_shapes_nonlinear(
+                    &source_motion,
+                    &source_shape,
+                    &target_motion,
+                    &target_shape,
+                    0.0,
+                    best_toi.real(),
+                    false,
+                )
+                .ok()
+                .flatten()
+                {
+                    let toi = hit.time_of_impact.f32();
+                    if toi > 0.0 && toi < best_toi {
+                        best_toi = toi;
+                    }
+                }
+            }
+        }
+    } else {
+        let source_shape = Cuboid::new(voxels2.voxel_size() / 2.0);
+        let target_shape = Cuboid::new(voxels1.voxel_size() / 2.0);
+
+        for source_voxel in voxels2.voxels() {
+            if source_voxel.state.is_empty() {
+                continue;
+            }
+
+            let source_motion = motion2.prepend_translation(source_voxel.center);
+            let query_aabb = swept_shape_aabb_in_voxel_space(
+                motion1,
+                &source_motion,
+                &source_shape,
+                best_toi.real(),
+                voxels1.voxel_size(),
+            );
+
+            for target_voxel in voxels1.voxels_intersecting_local_aabb(&query_aabb) {
+                if target_voxel.state.is_empty() {
+                    continue;
+                }
+
+                let target_motion = motion1.prepend_translation(target_voxel.center);
+                if let Some(hit) = cast_shapes_nonlinear(
+                    &target_motion,
+                    &target_shape,
+                    &source_motion,
+                    &source_shape,
+                    0.0,
+                    best_toi.real(),
+                    false,
+                )
+                .ok()
+                .flatten()
+                {
+                    let toi = hit.time_of_impact.f32();
+                    if toi > 0.0 && toi < best_toi {
+                        best_toi = toi;
+                    }
+                }
+            }
+        }
+    }
+
+    (best_toi < min_toi).then_some(best_toi)
+}
+
 #[cfg(all(test, feature = "3d", feature = "parry-f32"))]
 mod voxel_ccd_tests {
     use super::*;
@@ -1229,7 +1543,7 @@ mod voxel_ccd_tests {
         CcdFastShape {
             shape,
             // This field is only consumed by the convex-proxy path. Voxel TOI uses
-            // Parry's sparse voxel traversal directly.
+            // the rotation-aware sparse traversal above.
             swept_aabb: Aabb::new(Vector::splat(-1.0), Vector::splat(1.0)),
             local_centroid: Vector::ZERO,
             min_extent: 0.1,
@@ -1334,6 +1648,100 @@ mod voxel_ccd_tests {
                 -0.04,
             );
         }
+    }
+}
+
+    fn rotating_voxel_bar() -> SharedShape {
+        let coords: Vec<_> = (-10..10)
+            .map(|x| IVector::new(x, -1, -1))
+            .collect();
+        SharedShape::voxels(Vector::splat(0.1), &coords)
+    }
+
+    fn quarter_turn_motion() -> NonlinearRigidMotion {
+        NonlinearRigidMotion::new(
+            Pose::identity(),
+            Vector::ZERO,
+            Vector::ZERO,
+            Vector::new(0.0, 0.0, core::f32::consts::FRAC_PI_2 / DT),
+        )
+    }
+
+    #[test]
+    fn rotating_voxel_body_hits_a_static_wall() {
+        let bar = rotating_voxel_bar();
+        let wall = SharedShape::new(Cuboid::new(Vector::splat(0.05)));
+        let motion = quarter_turn_motion();
+        let wall_motion =
+            NonlinearRigidMotion::constant_position(Pose::translation(0.0, 0.8, 0.0));
+        let fast = fast_shape(bar.as_ref());
+
+        let toi = compute_ccd_toi(
+            SweepMode::NonLinear,
+            &motion,
+            &fast,
+            &wall_motion,
+            wall.as_ref(),
+            DT,
+            DT,
+            0.005,
+        )
+        .expect("rotating voxel bar must hit the wall");
+
+        assert!(toi > 0.0 && toi < DT, "invalid rotating voxel TOI: {toi}");
+    }
+
+    #[test]
+    fn rotating_voxel_wall_hits_a_static_convex_body() {
+        let bar = rotating_voxel_bar();
+        let body = SharedShape::new(Cuboid::new(Vector::splat(0.05)));
+        let body_motion =
+            NonlinearRigidMotion::constant_position(Pose::translation(0.0, 0.8, 0.0));
+        let bar_motion = quarter_turn_motion();
+        let fast = fast_shape(body.as_ref());
+
+        let toi = compute_ccd_toi(
+            SweepMode::NonLinear,
+            &body_motion,
+            &fast,
+            &bar_motion,
+            bar.as_ref(),
+            DT,
+            DT,
+            0.005,
+        )
+        .expect("rotating voxel wall must hit the convex body");
+
+        assert!(toi > 0.0 && toi < DT, "invalid target voxel TOI: {toi}");
+    }
+
+    #[test]
+    fn rotating_voxel_body_hits_another_voxel_body() {
+        let rotating_bar = rotating_voxel_bar();
+        let single_voxel =
+            SharedShape::voxels(Vector::splat(0.1), &[IVector::new(0, 0, 0)]);
+        let rotating_motion = quarter_turn_motion();
+        let single_motion = NonlinearRigidMotion::new(
+            Pose::translation(-0.05, 0.75, -0.05),
+            Vector::splat(0.05),
+            Vector::ZERO,
+            Vector::ZERO,
+        );
+        let fast = fast_shape(single_voxel.as_ref());
+
+        let toi = compute_ccd_toi(
+            SweepMode::NonLinear,
+            &single_motion,
+            &fast,
+            &rotating_motion,
+            rotating_bar.as_ref(),
+            DT,
+            DT,
+            0.005,
+        )
+        .expect("rotating voxel-to-voxel impact must be found");
+
+        assert!(toi > 0.0 && toi < DT, "invalid voxel-to-voxel TOI: {toi}");
     }
 }
 
