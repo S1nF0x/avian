@@ -614,6 +614,7 @@ struct CcdImpact {
     distance: f32,
 }
 
+#[cfg(any(feature = "parry-f32", feature = "parry-f64"))]
 fn has_closing_touching_voxel_contact(
     manifolds: &[crate::collision::contact_types::ContactManifold],
     linear_slop: f32,
