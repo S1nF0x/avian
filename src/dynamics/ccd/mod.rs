@@ -614,6 +614,17 @@ struct CcdImpact {
     distance: f32,
 }
 
+fn has_closing_touching_voxel_contact(
+    manifolds: &[crate::collision::contact_types::ContactManifold],
+    linear_slop: f32,
+) -> bool {
+    manifolds.iter().any(|manifold| {
+        manifold.points.iter().any(|point| {
+            point.penetration >= -linear_slop && point.normal_speed < -1.0e-4
+        })
+    })
+}
+
 /// Performs [Continuous Collision Detection](self).
 ///
 /// Every dynamic body whose per-frame motion is large relative to its thickness is treated
@@ -877,6 +888,7 @@ fn solve_continuous(
                     if voxel_pair {
                         voxel_candidates += 1;
                     }
+                    let mut closing_touching_voxel_contact = false;
                     if let Some((_, pair)) =
                         contact_graph.get(collider_entity, collider_entity2)
                     {
@@ -892,9 +904,7 @@ fn solve_continuous(
                             // support is already touching. Only skip such a
                             // pair if its existing manifolds are shallow and
                             // every contact normal is approximately tangent
-                            // to the entire body's impending motion. A new
-                            // wall hit, deep overlap, or substantial rotation
-                            // still requires the conservative voxel sweep.
+                            // to the entire body's impending motion.
                             let shallow_tangential_contact =
                                 body.delta_rotation.chord_length() * sweep_radius
                                     <= linear_slop
@@ -910,6 +920,20 @@ fn solve_continuous(
                             if shallow_tangential_contact {
                                 return true;
                             }
+
+                            // A touching voxel pair with any still-closing
+                            // point is already at TOI=0. The discrete solver
+                            // may have changed the body's angular velocity
+                            // during this step, but allowing its remaining
+                            // integrated motion can rotate another voxel
+                            // through the same wall. Clamp this timestep at
+                            // the existing surface and let the next narrow
+                            // phase/solver pass resolve the residual velocity.
+                            closing_touching_voxel_contact =
+                                has_closing_touching_voxel_contact(
+                                    &pair.manifolds,
+                                    linear_slop,
+                                );
                         }
                     }
 
@@ -965,6 +989,26 @@ fn solve_continuous(
                             0.0,
                         ),
                     };
+
+                    if closing_touching_voxel_contact {
+                        min_toi = 0.0;
+                        best_impact = Some(CcdImpact {
+                            collider1: collider_entity,
+                            collider2: collider_entity2,
+                            body1: proxy1.body,
+                            body2: proxy.body,
+                            contact_events: proxy1
+                                .flags
+                                .contains(crate::collider_tree::ColliderTreeProxyFlags::CONTACT_EVENTS)
+                                || proxy
+                                    .flags
+                                    .contains(crate::collider_tree::ColliderTreeProxyFlags::CONTACT_EVENTS),
+                            modify_contacts: proxy1.has_contact_modification()
+                                || proxy.has_contact_modification(),
+                            distance: target_max_motion + linear_slop,
+                        });
+                        return true;
+                    }
 
                     // Use a non-linear sweep unless both bodies opt into linear sweeps.
                     let sweep_mode = if mode1 == SweepMode::Linear && mode2 == SweepMode::Linear {
@@ -2031,6 +2075,31 @@ mod voxel_ccd_tests {
         .expect("multi-turn voxel sweep must find the intermediate 180-degree impact");
 
         assert!(toi > 0.0 && toi < DT * 0.5, "invalid winding TOI: {toi}");
+    }
+
+    #[test]
+    fn touching_voxel_contact_is_a_barrier_only_while_closing() {
+        use crate::collision::contact_types::{ContactManifold, ContactPoint};
+
+        let make_manifold = |penetration: f32, normal_speed: f32| {
+            let mut point = ContactPoint::new(
+                Vector::ZERO,
+                Vector::ZERO,
+                crate::math::RVector::ZERO,
+                penetration,
+            );
+            point.normal_speed = normal_speed;
+            ContactManifold::new([point], Vector::ZERO)
+        };
+
+        let closing = make_manifold(0.0, -1.0);
+        assert!(has_closing_touching_voxel_contact(&[closing], 0.005));
+
+        let separating = make_manifold(0.0, 1.0);
+        assert!(!has_closing_touching_voxel_contact(&[separating], 0.005));
+
+        let still_separated = make_manifold(-0.02, -1.0);
+        assert!(!has_closing_touching_voxel_contact(&[still_separated], 0.005));
     }
 
     #[test]
